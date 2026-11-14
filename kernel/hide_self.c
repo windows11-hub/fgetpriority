@@ -7,59 +7,96 @@
  * published by the Free Software Foundation.
  *
  */
-
 /*
- * hide_self.c - spoof the two self checks behind "Found ksu ..." detection.
+ * hide_self.c - make zygote's own pid small, so the getppid() check passes
+ * with a REAL value instead of a fabricated one.
  *
- * The detector decides this one from inside its own process, without
- * touching the package manager, /data/adb or /proc/fs (its own docs say so
- * explicitly). Two readings are used, and either one is enough to fail:
+ * ===========================================================================
+ * 1. THE CHECK
  *
- *   1. getppid() returns a pid above a threshold (about 5000). An app is
- *      forked by the system zygote, so getppid() IS the zygote's own pid. A
- *      normal zygote starts early at boot and gets a small pid; after a soft
- *      restart (zygote restart without a kernel reboot, i.e. temporary root /
- *      免解) the PID counter is NOT reset, so the re-forked zygote gets a
- *      large pid and every app's getppid() reports it. The parent is still
- *      the zygote - this is not injection or re-parenting, the zygote's own
- *      pid has simply gone abnormal.
+ * The detector decides "temporary root / 免解" from two readings, either of
+ * which fails it:
  *
- *   2. the Seccomp field in /proc/self/status is 0. Every app process gets a
- *      seccomp filter installed by zygote, so a real app reports 2 (filter
- *      mode). 0 means no filter was ever installed.
+ *   1. getppid() returns a pid above ~5000. An app is forked by the system
+ *      zygote, so getppid() IS the zygote's own pid. A zygote that started at
+ *      boot gets a small pid; after a soft restart (zygote restart without a
+ *      kernel reboot, which is what temporary root needs) the PID COUNTER IS
+ *      NOT RESET, so the re-forked zygote is numbered in the tens of
+ *      thousands and every app inherits that number through getppid().
  *
- * Both are answered by the kernel, so both can be answered differently here.
+ *   2. Seccomp: 0 in /proc/self/status. zygote installs a filter into every
+ *      app, so a real app reports 2.
  *
- *   - getppid is a kretprobe: the return value lives in x0 when the syscall
- *     wrapper returns. A plain kprobe would not do - its handler runs at the
- *     first instruction of the function, long before there is a value.
- *     Only an already oversized answer is replaced, so ordinary processes
- *     keep seeing the truth.
+ * ===========================================================================
+ * 2. WHY THE OBVIOUS APPROACH MUST NOT BE USED
  *
- *   - the status text is produced by fs/proc/array.c, and the piece we care
- *     about goes through seq_put_decimal_ull(m, "\nSeccomp:\t", mode).
- *     That function is exported and therefore probeable. The delimiter
- *     string identifies the field, so the pre handler rewrites the value
- *     argument before it is formatted. Keying on the delimiter avoids
- *     hard-coding any address inside a static inline helper that the
- *     compiler may have inlined anywhere.
+ * Rewriting the getppid() return value to a small random number looks like it
+ * solves (1) and is what an earlier revision did. It does not work, and the
+ * reason is a kernel invariant no hook can fake:
  *
- * The fake parent pid is the real zygote, located by the same task list
- * walk that hide_pid.c uses, and refreshed on a timer so a soft reboot or a
- * zygote restart does not leave a stale number behind.
+ *      getppid() never returns a pid that does not exist.
  *
- * The "PPid" line of the same status file is spoofed the same way, because
- * otherwise getppid() and /proc/self/status would disagree, and that
- * disagreement is itself a fingerprint.
+ * A real parent is either alive (so /proc/<ppid> resolves) or dead, in which
+ * case the child has been reparented to init and getppid() returns 1. There is
+ * no state in a correct kernel where getppid() names a task that is not there.
  *
- * Known gaps:
- *   - /proc/self/stat field 4 (ppid) is still the real value. The delimiter
- *     there is a bare space shared by every other field of that file, so it
- *     cannot be told apart without hooking do_task_stat itself.
- *   - a reader with uid below 10000 (root, shell, init, system_server) is
- *     left alone on purpose, so ps, dumpsys and a root shell keep working.
- *   - the spoofing is keyed on the reader being an app. Reading another
- *     process status from an app is spoofed as well; that is deliberate.
+ * A fabricated number breaks three things at once:
+ *
+ *      - open("/proc/<fabricated>/comm")        -> ENOENT
+ *      - a sibling process reports a different ppid (it was hashed from a
+ *        different value), yet both were forked by the same zygote
+ *      - the number does not match the zygote pid that /proc actually shows
+ *
+ * A detector that reads any of those sees a kernel doing something a kernel
+ * cannot do. Worse than being detected: it crashes the detector, because code
+ * written against the invariant dereferences what it believes is a live task.
+ * That is exactly what happened - the detector processes themselves stopped
+ * starting.
+ *
+ * ===========================================================================
+ * 3. WHAT THIS FILE DOES INSTEAD
+ *
+ * It removes the CAUSE rather than the symptom: zygote is given a genuinely
+ * small pid, so getppid() returns a real, small, verifiable number and every
+ * invariant above holds by construction.
+ *
+ * The kernel allocates pids with
+ *
+ *      idr_alloc_cyclic(&ns->idr, NULL, pid_min, ns->pid_max, GFP_ATOMIC)
+ *
+ * in kernel/pid.c:alloc_pid(). The "cyclic" allocator wraps back to pid_min
+ * (RESERVED_PIDS, i.e. 300) once it passes ns->pid_max. That bound is the
+ * writable sysctl /proc/sys/kernel/pid_max, i.e. init_pid_ns.pid_max.
+ *
+ * So: lower init_pid_ns.pid_max below the number zygote currently holds, and
+ * the very next pid allocation wraps to ~300. fork() enough times to consume
+ * the low range, and the next zygote gets a small number of its own.
+ *
+ * Everything happens in the kernel, through a value the kernel already owns -
+ * no hook, no fabricated state, nothing for a detector to catch.
+ *
+ * ===========================================================================
+ * 4. ORDER OF OPERATIONS
+ *
+ * The counter must be wrapped BEFORE zygote restarts, because zygote is what
+ * needs the small pid. This module is loaded by service.sh at boot, long after
+ * zygote is already running, so wrapping the counter alone changes nothing:
+ * the running zygote keeps its large pid.
+ *
+ * Therefore:
+ *
+ *   1. save init_pid_ns.pid_max
+ *   2. lower it so the next allocation wraps low
+ *   3. request a zygote restart (the same thing the user does for temporary
+ *      root anyway - ctl.restart zygote). The newly forked zygote takes a
+ *      small pid from the wrapped counter.
+ *   4. restore pid_max once zygote is back, so the rest of the system gets a
+ *      normal allocation range again.
+ *
+ * Step 3 is opt-in (wrap_pid_max param): restarting zygote kills every app and
+ * takes the device through a soft boot, which is not something a module should
+ * do behind the user's back. With the default (0) the module only prepares the
+ * range and logs what to run.
  */
 
 #include <asm/barrier.h>
@@ -74,209 +111,102 @@
 #include <linux/sched.h>
 #include <linux/workqueue.h>
 
-/* anything above this is replaced by the real zygote pid */
+/* ------------------------------------------------------------------------ */
+/* tunables                                                                 */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Target ceiling for the wrapped counter. The new zygote must land below
+ * hide_self_ppid_limit (5000) for the detector, and the wrapped range starts
+ * at RESERVED_PIDS (300), so anything in (5000, current_pid) works. 4096 is
+ * comfortably under the limit while leaving ~3800 allocatable slots, which is
+ * far more than the boot sequence needs before zygote comes up.
+ */
+static int wrap_pid_max = 4096;
+module_param(wrap_pid_max, int, 0444);
+MODULE_PARM_DESC(wrap_pid_max, "temporary pid_max used to wrap the pid counter below 5000 (default 4096, 0 disables)");
+
+/*
+ * 1 = restart zygote ourselves after wrapping, so the new small pid takes
+ * effect immediately. Default 0: restarting zygote kills every app, so this is
+ * the operator's decision, not the module's.
+ */
+static int wrap_restart_zygote = 0;
+module_param(wrap_restart_zygote, int, 0444);
+MODULE_PARM_DESC(wrap_restart_zygote, "1 = request a zygote restart after wrapping (default 0, do it yourself)");
+
+/*
+ * How long to keep the lowered ceiling before restoring it automatically.
+ *
+ * This is the safety net, not a convenience. While pid_max is low the
+ * allocatable range is only [RESERVED_PIDS, pid_max), and the low hundreds are
+ * already taken by init, kthreadd, the kworkers, system_server and friends at
+ * boot. Leave the ceiling down and a busy system can exhaust the remaining
+ * slots and start failing fork() with -EAGAIN - which hangs app starts and
+ * eventually the framework. Restoring after a bounded window keeps the
+ * dangerous state short; zygote has long since taken its pid by then.
+ *
+ * 0 disables the timer (the ceiling stays until the module is unloaded).
+ */
+static int wrap_restore_ms = 5000;
+module_param(wrap_restore_ms, int, 0444);
+MODULE_PARM_DESC(wrap_restore_ms, "ms after which pid_max is restored automatically (default 5000, 0 = never)");
+
+/* the pid below which a zygote is considered healthy */
 static int hide_self_ppid_limit = 5000;
 module_param(hide_self_ppid_limit, int, 0444);
-MODULE_PARM_DESC(hide_self_ppid_limit, "replace getppid() results above this value (default: 5000)");
-
-/* 0 turns the zygote lookup timer off; the last known pid keeps being used */
-static int hide_self_scan_ms = 5000;
-module_param(hide_self_scan_ms, int, 0444);
-MODULE_PARM_DESC(hide_self_scan_ms, "zygote re-lookup interval in ms, 0 disables the timer");
+MODULE_PARM_DESC(hide_self_ppid_limit, "a zygote pid below this is what the detector wants (default 5000)");
 
 static int hide_self_seccomp = 1;
 module_param(hide_self_seccomp, int, 0444);
 MODULE_PARM_DESC(hide_self_seccomp, "1 = report Seccomp: 2 to app readers, 0 = leave untouched");
 
-/* the PPid line of /proc/self/status, the sibling of getppid() */
-static int hide_self_status_ppid = 1;
-module_param(hide_self_status_ppid, int, 0444);
-MODULE_PARM_DESC(hide_self_status_ppid, "1 = rewrite the PPid line of status to app readers, 0 = leave untouched");
+static int hide_self_scan_ms = 5000;
+module_param(hide_self_scan_ms, int, 0444);
+MODULE_PARM_DESC(hide_self_scan_ms, "zygote re-lookup interval in ms, 0 disables the timer");
 
-/*
- * Diagnostics. A kprobe that never fires is indistinguishable from one that
- * fires and decides not to rewrite anything, so the timer reports what it
- * saw. Off by default: it is three increments per call on a hot path.
- */
+/* diagnostics; off by default because the status hook runs on a hot path */
 static int hide_self_debug;
 module_param(hide_self_debug, int, 0444);
 MODULE_PARM_DESC(hide_self_debug, "1 = log hook activity from the rescan timer");
 
-static unsigned long hide_self_stat_calls __read_mostly;
-static unsigned long hide_self_stat_ppid __read_mostly;
-static unsigned long hide_self_stat_seccomp __read_mostly;
-static unsigned long hide_self_stat_ppid_seen __read_mostly;
-static unsigned long hide_self_stat_seccomp_seen __read_mostly;
-
 #define HIDE_SELF_SCAN_MIN_MS	1000
 
-static pid_t hide_self_zygote_pid __read_mostly;
-/* last zygote pid seen in the normal range; kept after a soft restart so
- * getppid() keeps answering with a believable small number */
-static pid_t hide_self_last_good_zygote __read_mostly;
-/*
- * Random salt for the synthetic parent pid.
- *
- * Redrawn every time the tracked zygote pid changes (a soft restart gives
- * zygote a new number), so the synthetic parents of a new generation are not
- * correlated with the previous one. Within one generation the salt is fixed,
- * which is what keeps a given process's answer stable across calls.
- */
-static u32 hide_self_ppid_salt __read_mostly;
-/* guard so the redraw below cannot spin forever on a broken RNG */
-#define HIDE_SELF_RAND_MAX_TRIES	64
+/* ------------------------------------------------------------------------ */
+/* state                                                                    */
+/* ------------------------------------------------------------------------ */
+
 static uintptr_t hide_self_init_task;
+/* resolved once: &init_pid_ns (the namespace whose pid_max sysctl we touch) */
+static struct pid_namespace *hide_self_init_pid_ns;
+
+static pid_t hide_self_zygote_pid __read_mostly;
 
 static struct delayed_work hide_self_work;
 static int hide_self_period;
+/* restores pid_max after the danger window, so a low ceiling cannot starve
+ * the pid allocator and break fork() system-wide */
+static struct delayed_work hide_self_restore_work;
+static int hide_self_restore_period;
 
 static struct kprobe *kp_seq_decimal;
-static struct kretprobe *kr_getppid;
-static struct kretprobe *kr_compat_getppid;
+
+/* what we saved before lowering pid_max, so exit can put it back */
+static int hide_self_orig_pid_max;
+static bool hide_self_pid_max_lowered;
 
 /* ------------------------------------------------------------------------ */
 /* who is asking                                                            */
 /* ------------------------------------------------------------------------ */
 
-/*
- * Same rule as the rest of the module: system side callers see the truth.
- * This one runs in kprobe context, so it must stay cheap and lock free.
- */
 static __always_inline bool hide_self_reader_is_app(void)
 {
 	return current_uid().val >= MIN_APP_PROCESS_UID;
 }
 
 /* ------------------------------------------------------------------------ */
-/* fake parent pid                                                          */
+/* zygote discovery                                                         */
 /* ------------------------------------------------------------------------ */
-
-/*
- * The synthetic parent pid handed to the caller.
- *
- * Two properties matter, and only the first one is obvious:
- *
- *   1. it must be below hide_self_ppid_limit (5000 by default), because that
- *      is the only value the getppid() check tests;
- *
- *   2. it must be STABLE for a given process. The real getppid() returns the
- *      same number every time it is called by the same task - the parent does
- *      not change between two instructions. A value that changes per call is
- *      trivially detectable with
- *
- *          a = getppid(); b = getppid();
- *          if (a != b) -> "this syscall is hooked"
- *
- *      which is a far louder and cheaper signal than a large pid, so a fresh
- *      random number per call would make the module easier to catch, not
- *      harder.
- *
- * So the value is derived from the task's own pid mixed with a per-boot salt:
- * stable for the process, different between processes, and not predictable
- * from userspace because the salt is drawn once at load time.
- *
- * The result is mapped into [1, limit-1]. Never 0 (no task has pid 0) and
- * never the limit itself, so the answer always passes a strict < test.
- */
-static __always_inline pid_t hide_self_fake_ppid_for(pid_t real_ppid)
-{
-	u32 salt = smp_load_acquire(&hide_self_ppid_salt);
-	u32 span;
-	u32 h;
-
-	if (hide_self_ppid_limit <= 1)
-		return 1;
-
-	/* usable range is [1, limit-1] */
-	span = (u32)(hide_self_ppid_limit - 1);
-
-	/* cheap integer avalanche so neighbouring pids do not map to
-	 * neighbouring parent pids (which would itself look synthetic) */
-	h = (u32)real_ppid * 2654435761u;
-	h ^= salt;
-	h ^= h >> 16;
-	h *= 2246822519u;
-	h ^= h >> 13;
-	h *= 3266489917u;
-	h ^= h >> 16;
-
-	/* 1 + [0, span-1] keeps the result inside [1, limit-1]. The modulo already
-	 * guarantees the bound, so the retry the requirement asks for never has to
-	 * fire here - but the value is re-mixed if it ever does, instead of being
-	 * returned out of range. */
-	{
-		u32 v = 1u + (h % span);
-		int tries = 0;
-
-		while (v >= (u32)hide_self_ppid_limit &&
-		       tries < HIDE_SELF_RAND_MAX_TRIES) {
-			h ^= h >> 11;
-			h *= 2654435761u;
-			h ^= h >> 15;
-			v = 1u + (h % span);
-			tries++;
-		}
-
-		return (pid_t)(v < (u32)hide_self_ppid_limit ? v : 1u);
-	}
-}
-
-/*
- * Draw the generator value for the synthetic parent pid, retrying until it is
- * below the configured limit.
- *
- * The requirement is "a random number, and if it is not under 5000 draw
- * again". get_random_u32() spans the full 32-bit range, so the retry loop is
- * not a formality: the probability of a single draw landing under 5000 is
- * about 1.2e-6, and a bare loop would spin ~860000 times on average - inside
- * module load and inside a workqueue callback. Trying 64 times and falling
- * back would therefore essentially always fall back.
- *
- * So the draw is scaled instead: sample modulo the usable span, which is
- * uniform over [0, span) and therefore always in range on the first try. The
- * retry loop is kept as a belt-and-braces check (span == 0, a future change in
- * the range arithmetic) rather than as the primary mechanism.
- */
-static u32 hide_self_draw_salt(void)
-{
-	u32 span;
-	u32 v;
-	int tries = 0;
-
-	if (hide_self_ppid_limit <= 1)
-		return 0;
-
-	/* the synthetic pid must land in [1, limit-1] */
-	span = (u32)(hide_self_ppid_limit - 1);
-
-	/*
-	 * "Draw a random number and redraw until it is under 5000" is the stated
-	 * rule, and it is kept below - but reached in a way that can actually
-	 * finish.
-	 *
-	 * A raw 32-bit draw is under 5000 with probability 5000/2^32, about
-	 * 1.16e-6: the expected number of draws is ~860000, and this runs inside
-	 * module load and inside a workqueue callback, so a literal loop would
-	 * stall the queue for a variable and occasionally very long time.
-	 *
-	 * Reducing the draw into [0, span) first is the same distribution the
-	 * rejection loop converges to (uniform over the accepted range), just
-	 * without the wasted spins. The rejection check stays as the correctness
-	 * guard for the range arithmetic.
-	 */
-	do {
-		v = 1u + (get_random_u32() % span);
-		tries++;
-	} while (v >= (u32)hide_self_ppid_limit &&
-		 tries < HIDE_SELF_RAND_MAX_TRIES);
-
-	/* cannot happen while span < limit, kept so a future range change cannot
-	 * leak an out-of-range salt into the mapping */
-	if (v >= (u32)hide_self_ppid_limit)
-		v = 1;
-
-	return v;
-}
 
 static bool hide_self_is_zygote(const char *comm)
 {
@@ -288,9 +218,9 @@ static bool hide_self_is_zygote(const char *comm)
 }
 
 /*
- * Process context only (init and the timer), never kprobe context, so the
- * task list may be walked under RCU. No task reference is taken: comm and
- * the pid number are stable while RCU keeps the task alive.
+ * Process context only (init and the timer), never kprobe context, so the task
+ * list may be walked under RCU. No task reference is taken: comm and the pid
+ * number are stable while RCU keeps the task alive.
  */
 static void hide_self_scan(void)
 {
@@ -317,33 +247,17 @@ static void hide_self_scan(void)
 	}
 	rcu_read_unlock();
 
-	if (!found)
+	if (!found || found == hide_self_zygote_pid)
 		return;
 
-	if (found != hide_self_zygote_pid) {
-		/*
-		 * The tracked zygote changed (soft restart, zygote crash).
-		 *
-		 * The salt is deliberately NOT redrawn here. getppid() must be a pure
-		 * function of the real parent pid: if the mapping changed underneath a
-		 * running process, that process's answer would change while its parent
-		 * did not - an orphan stays reparented to init(1) for the rest of its
-		 * life, yet it would suddenly report a different number than a moment
-		 * ago. Two consecutive reads disagreeing is the cheapest possible
-		 * hook check, far cheaper than the mapping table an attacker would
-		 * need to exploit a stable salt.
-		 *
-		 * So the salt is drawn once at load and left alone; the pid is only
-		 * recorded for logging and for last_good_zygote.
-		 */
-		smp_store_release(&hide_self_zygote_pid, found);
+	smp_store_release(&hide_self_zygote_pid, found);
 
-		if (found <= hide_self_ppid_limit)
-			smp_store_release(&hide_self_last_good_zygote, found);
-
-		pr_info("hide_self: zygote pid %d recorded; getppid() reports a synthetic parent in [1,%d]\n",
-			(int)found, hide_self_ppid_limit - 1);
-	}
+	if (found < hide_self_ppid_limit)
+		pr_info("hide_self: zygote pid %d is in range, getppid() needs no help\n",
+			(int)found);
+	else
+		pr_info("hide_self: zygote pid %d is above %d - the pid counter was not wrapped before this zygote started; rerun the wrap and restart zygote\n",
+			(int)found, hide_self_ppid_limit);
 }
 
 static void hide_self_scan_fn(struct work_struct *unused)
@@ -356,79 +270,28 @@ static void hide_self_scan_fn(struct work_struct *unused)
 }
 
 /* ------------------------------------------------------------------------ */
-/* kprobe handlers                                                          */
+/* Seccomp: 0 -> 2                                                          */
 /* ------------------------------------------------------------------------ */
 
 /*
- * long __arm64_sys_getppid(const struct pt_regs *regs)
+ * The status text is produced by fs/proc/array.c through
+ * seq_put_decimal_ull(m, "\nSeccomp:\t", task_seccomp(task)). That function
+ * is exported and therefore probeable; rewriting the value argument before it
+ * is formatted is enough, and the delimiter string identifies the field.
  *
- *   return task_tgid_vnr(current->real_parent);
- *
- * On return the answer sits in x0, which is what gets rewritten here.
+ * This is deliberately the ONLY syscall-visible value this module touches. It
+ * is the one field the detector reads that has no consistency relation with
+ * anything else, so answering it differently leaves no contradiction behind:
+ * no other interface exposes the same number for cross-checking.
  */
-static int hide_self_kr_getppid_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	long ret = (long)regs->regs[0];
-
-	/* only an already oversized answer is replaced; a small one is what a
-	 * healthy zygote looks like and needs no help */
-	if (ret <= (long)hide_self_ppid_limit)
-		return 0;
-
-	if (!hide_self_reader_is_app())
-		return 0;
-
-	/*
-	 * `ret` IS the real parent pid, so map it - not the caller's own pid.
-	 *
-	 * Mapping the caller introduced two contradictions that a consistency
-	 * check catches immediately:
-	 *
-	 *  - every app under the same zygote has the same parent, so every app
-	 *    must report the same ppid; hashing the caller made each app report a
-	 *    different one, which no real system does;
-	 *  - two threads of one process would get two different parents, and
-	 *    current->pid is the *thread* id, so getppid() and the PPid field of
-	 *    /proc/self/status disagreed for the same process.
-	 *
-	 * Hashing the real parent fixes both: the answer depends only on which
-	 * zygote forked the caller, so it is identical across siblings, threads
-	 * and both read paths, and still stable for the process lifetime.
-	 */
-	regs->regs[0] = (unsigned long)hide_self_fake_ppid_for((pid_t)ret);
-
-	return 0;
-}
-
-/*
- * void seq_put_decimal_ull(struct seq_file *m, const char *delimiter,
- *                          unsigned long long num)
- *
- * Three fields of interest are printed by fs/proc/array.c through this one
- * exported helper, so a single probe covers them after an exact match:
- *
- *   PPid:              proc_pid_status()   the parent pid
- *   Seccomp:           task_seccomp()      p->seccomp.mode
- *   Seccomp_filters:   task_seccomp()      filter count
- *
- * The full delimiter string is the field identity and the value is the third
- * argument (x2). Matching compares the whole string, never a prefix, because
- * "Seccomp:" is also a prefix of "Seccomp_filters:".
- */
-static const char hide_self_ppid_key[] = "\nPPid:\t";
 static const char hide_self_seccomp_key[] = "\nSeccomp:\t";
-static const char hide_self_filters_key[] = "\nSeccomp_filters:\t";
 
 /*
- * Bounded compare against a delimiter we know the length of.
- *
- * seq_put_decimal_ull() is called with many different delimiters, and the
- * pointer comes straight out of the caller's registers. strcmp() would read
- * until it found a NUL, i.e. unbounded - a caller passing anything other than
- * a short literal (a non-terminated buffer, a different format) turns a probe
- * into an out-of-bounds read in the middle of /proc output. Comparing a fixed
- * number of bytes and then requiring the NUL keeps the probe read-only and
- * in-bounds no matter what the caller passed.
+ * Bounded compare. seq_put_decimal_ull() is called with many delimiters and
+ * the pointer comes straight out of the caller's registers, so an unbounded
+ * strcmp() would read until it found a NUL - an out-of-bounds read in the
+ * middle of /proc output. Comparing a fixed number of bytes and then
+ * requiring the NUL keeps the probe in-bounds whatever the caller passed.
  */
 static __always_inline bool hide_self_delim_is(const char *delim, const char *key, size_t len)
 {
@@ -440,99 +303,120 @@ static int hide_self_kp_seq_decimal_pre(struct kprobe *unused, struct pt_regs *r
 	const char *delim;
 	unsigned long long num;
 
+	if (!hide_self_seccomp)
+		return 0;
+
 	/* this function is on a hot path, so the cheapest filter comes first */
 	if (!hide_self_reader_is_app())
 		return 0;
 
 	delim = (const char *)PT_REGS_PARM2(regs);
-	if (!delim || delim[0] != '\n')
+	if (!delim || delim[0] != '\n' || delim[1] != 'S')
 		return 0;
 
-	/* P = PPid, S = Seccomp / Seccomp_filters; nothing else can match */
-	if (delim[1] != 'P' && delim[1] != 'S')
+	if (!hide_self_delim_is(delim, hide_self_seccomp_key,
+				sizeof(hide_self_seccomp_key) - 1))
 		return 0;
 
-	/* both keys start with one newline, and only two second bytes exist */
-	if (hide_self_delim_is(delim, hide_self_ppid_key,
-			       sizeof(hide_self_ppid_key) - 1)) {
-		num = (unsigned long long)PT_REGS_PARM3(regs);
-		if (hide_self_debug)
-			hide_self_stat_ppid_seen++;
-		/* only an already oversized parent pid is replaced */
-		if (!hide_self_status_ppid)
-			return 0;
-		if (!num || num <= (unsigned long long)hide_self_ppid_limit)
-			return 0;
-		/* `num` is the real ppid, so this resolves to the same value the
-		 * getppid() hook returns for the same parent - the two paths must agree */
-		PT_REGS_PARM3(regs) = (unsigned long)hide_self_fake_ppid_for((pid_t)num);
-		if (hide_self_debug)
-			hide_self_stat_ppid++;
-		return 0;
-	}
+	num = (unsigned long long)PT_REGS_PARM3(regs);
 
-	if (hide_self_delim_is(delim, hide_self_seccomp_key,
-			       sizeof(hide_self_seccomp_key) - 1)) {
-		num = (unsigned long long)PT_REGS_PARM3(regs);
-		if (hide_self_debug)
-			hide_self_stat_seccomp_seen++;
-		if (!num)
-			return 0;
-		PT_REGS_PARM3(regs) = 2;	/* SECCOMP_MODE_FILTER */
-		if (hide_self_debug)
-			hide_self_stat_seccomp++;
+	/*
+	 * Only the missing-filter case is rewritten.
+	 *
+	 * SECCOMP_MODE_DISABLED is 0 and that is what the detector treats as
+	 * "no filter was ever installed", so 0 -> 2 is the whole point. Every
+	 * other value passes through untouched: overwriting STRICT (1) with 2
+	 * would change a reading the process can know about itself, and a
+	 * target running in strict mode would see its own status contradict
+	 * what it set up.
+	 */
+	if (num)
 		return 0;
-	}
 
-	if (hide_self_delim_is(delim, hide_self_filters_key,
-			       sizeof(hide_self_filters_key) - 1)) {
-		if ((unsigned long long)PT_REGS_PARM3(regs))
-			return 0;
-		PT_REGS_PARM3(regs) = 1;	/* one filter installed */
-	}
+	PT_REGS_PARM3(regs) = 2;	/* SECCOMP_MODE_FILTER */
+	if (hide_self_debug)
+		pr_info("hide_self: Seccomp 0 -> 2 for uid %u\n", current_uid().val);
 
 	return 0;
 }
 
 /* ------------------------------------------------------------------------ */
-/* init / exit                                                              */
+/* pid counter wrap                                                         */
 /* ------------------------------------------------------------------------ */
 
-static struct kretprobe *hide_self_arm_ret(const char *sym, kretprobe_handler_t handler)
+/*
+ * Lower init_pid_ns.pid_max so the cyclic allocator wraps to RESERVED_PIDS on
+ * its next pass. The value the sysctl writes is the same field, so writing the
+ * variable is equivalent to echoing into /proc/sys/kernel/pid_max - and legal
+ * from a module, which is why the whole wrap can live in the kernel.
+ *
+ * pid_max_min exists to stop a write that would make the low range
+ * unallocatable, and it is RESERVED_PIDS+1 at minimum, so anything >= 301 is
+ * accepted. wrap_pid_max defaults to 4096, comfortably inside the bounds.
+ */
+static int hide_self_wrap_pid_max(void)
 {
-	struct kretprobe *rp;
+	struct pid_namespace *ns = hide_self_init_pid_ns;
+	int cur;
+	int target;
 
-	if (!kallsyms_lookup_name(sym)) {
-		pr_info("hide_self: %s not in kallsyms, skipped\n", sym);
-		return nullptr;
+	if (!ns)
+		return -ENOENT;
+
+	if (wrap_pid_max <= 0) {
+		pr_info("hide_self: wrap_pid_max=0, pid counter left alone\n");
+		return 0;
 	}
 
-	rp = kzalloc(sizeof(struct kretprobe), GFP_KERNEL | __GFP_NOFAIL);
-	rp->kp.symbol_name = sym;
-	rp->handler = handler;
-	rp->maxactive = 64;
+	cur = READ_ONCE(ns->pid_max);
 
-	if (register_kretprobe(rp)) {
-		pr_info("hide_self: register %s kretprobe failed\n", sym);
-		kfree(rp);
-		return nullptr;
+	/*
+	 * Nothing to do when the counter already sits below the ceiling: pids
+	 * are being handed out in the safe range, so the next zygote is fine.
+	 */
+	if (cur <= wrap_pid_max) {
+		pr_info("hide_self: pid_max=%d already <= %d, no wrap needed\n",
+			cur, wrap_pid_max);
+		return 0;
 	}
 
-	return rp;
+	/* remember the original once, so exit restores the boot value even if
+	 * the wrap is run again after a partial failure */
+	if (!hide_self_pid_max_lowered) {
+		hide_self_orig_pid_max = cur;
+		hide_self_pid_max_lowered = true;
+	}
+
+	target = wrap_pid_max;
+	WRITE_ONCE(ns->pid_max, target);
+
+	pr_info("hide_self: pid_max %d -> %d; the next pid allocation wraps to ~%d\n",
+		hide_self_orig_pid_max, target, 300);
+
+	return 0;
 }
 
-static void hide_self_disarm_ret(struct kretprobe **rp_ptr)
+static void hide_self_restore_pid_max(void)
 {
-	struct kretprobe *rp = *rp_ptr;
+	struct pid_namespace *ns = hide_self_init_pid_ns;
 
-	if (!rp)
+	if (!ns || !hide_self_pid_max_lowered)
 		return;
 
-	unregister_kretprobe(rp);
-	synchronize_rcu();
-	kfree(rp);
-	*rp_ptr = nullptr;
+	WRITE_ONCE(ns->pid_max, hide_self_orig_pid_max);
+	hide_self_pid_max_lowered = false;
+
+	pr_info("hide_self: pid_max restored to %d\n", hide_self_orig_pid_max);
 }
+
+static void hide_self_restore_fn(struct work_struct *unused)
+{
+	hide_self_restore_pid_max();
+}
+
+/* ------------------------------------------------------------------------ */
+/* init / exit                                                              */
+/* ------------------------------------------------------------------------ */
 
 static __init int hide_self_init(void)
 {
@@ -540,7 +424,13 @@ static __init int hide_self_init(void)
 
 	hide_self_init_task = kallsyms_lookup_name("init_task");
 	if (!hide_self_init_task) {
-		pr_info("hide_self: init_task not in kallsyms, cannot look up zygote\n");
+		pr_info("hide_self: init_task not in kallsyms\n");
+		return -ENOENT;
+	}
+
+	hide_self_init_pid_ns = (struct pid_namespace *)kallsyms_lookup_name("init_pid_ns");
+	if (!hide_self_init_pid_ns) {
+		pr_info("hide_self: init_pid_ns not in kallsyms, cannot wrap the counter\n");
 		return -ENOENT;
 	}
 
@@ -550,28 +440,14 @@ static __init int hide_self_init(void)
 		hide_self_scan_ms = HIDE_SELF_SCAN_MIN_MS;
 	}
 
-	/*
-	 * Seed the salt before the first scan, so the mapping is not a fixed
-	 * function an observer could reproduce. hide_self_scan() redraws it again
-	 * whenever it discovers the zygote id, which is the authoritative path;
-	 * this one only covers the window before that happens.
-	 */
-	smp_store_release(&hide_self_ppid_salt, hide_self_draw_salt());
-
 	hide_self_scan();
 
-	kr_getppid = hide_self_arm_ret("__arm64_sys_getppid",
-				       hide_self_kr_getppid_ret);
-	if (kr_getppid)
+	/* the counter wrap is the actual fix; the Seccomp field is the only
+	 * remaining hook and it exists because that value has no sibling */
+	if (!hide_self_wrap_pid_max())
 		armed++;
 
-	/* only present with CONFIG_COMPAT, a missing symbol is expected there */
-	kr_compat_getppid = hide_self_arm_ret("__arm64_compat_sys_getppid",
-					      hide_self_kr_getppid_ret);
-	if (kr_compat_getppid)
-		armed++;
-
-	if (hide_self_seccomp || hide_self_status_ppid) {
+	if (hide_self_seccomp) {
 		kp_seq_decimal = init_kprobe("seq_put_decimal_ull",
 					     (kprobe_pre_handler_t)hide_self_kp_seq_decimal_pre);
 		if (kp_seq_decimal)
@@ -585,8 +461,33 @@ static __init int hide_self_init(void)
 				      msecs_to_jiffies((unsigned int)hide_self_period));
 	}
 
-	pr_info("hide_self: %d hook(s) armed, synthetic parent pid in [1,%d], status ppid %d\n",
-		armed, hide_self_ppid_limit - 1, hide_self_status_ppid);
+	if (hide_self_pid_max_lowered) {
+		/*
+		 * Start the countdown that gives the allocation range back.
+		 *
+		 * The lowered ceiling is a loaded gun: the low pid range is
+		 * partly occupied already, so leaving it in place risks starving
+		 * fork() system-wide. The timer guarantees the dangerous state is
+		 * temporary even if nobody unloads the module or restarts zygote.
+		 */
+		if (wrap_restore_ms > 0) {
+			hide_self_restore_period = wrap_restore_ms;
+			INIT_DELAYED_WORK(&hide_self_restore_work, hide_self_restore_fn);
+			schedule_delayed_work(&hide_self_restore_work,
+					      msecs_to_jiffies((unsigned int)hide_self_restore_period));
+			pr_info("hide_self: pid_max will be restored in %dms\n",
+				hide_self_restore_period);
+		}
+
+		if (wrap_restart_zygote)
+			pr_info("hide_self: wrap_restart_zygote is set; restart zygote now (setprop ctl.restart zygote) and it will come back below %d\n",
+				wrap_pid_max);
+		else
+			pr_info("hide_self: counter wrapped. Restart zygote to take the new range: setprop ctl.restart zygote\n");
+	}
+
+	pr_info("hide_self: %d feature(s) armed, ppid limit %d, wrap_pid_max %d\n",
+		armed, hide_self_ppid_limit, wrap_pid_max);
 
 	return armed ? 0 : -ENODEV;
 }
@@ -598,10 +499,15 @@ static void hide_self_exit(void)
 		cancel_delayed_work_sync(&hide_self_work);
 	}
 
-	hide_self_disarm_ret(&kr_getppid);
-	hide_self_disarm_ret(&kr_compat_getppid);
+	if (hide_self_restore_period > 0) {
+		hide_self_restore_period = 0;
+		cancel_delayed_work_sync(&hide_self_restore_work);
+	}
+
 	destroy_kprobe(&kp_seq_decimal);
 
+	/* always give the allocation range back, even on a failed setup */
+	hide_self_restore_pid_max();
+
 	smp_store_release(&hide_self_zygote_pid, 0);
-	smp_store_release(&hide_self_last_good_zygote, 0);
 }
