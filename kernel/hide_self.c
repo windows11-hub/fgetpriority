@@ -15,11 +15,14 @@
  * touching the package manager, /data/adb or /proc/fs (its own docs say so
  * explicitly). Two readings are used, and either one is enough to fail:
  *
- *   1. getppid() returns a pid above a threshold (about 5000). A normal app
- *      is forked by the system zygote that started early at boot, so its
- *      parent pid is small; a large one means the parent is not the zygote
- *      that is expected, which is typical for injected or re-parented
- *      processes.
+ *   1. getppid() returns a pid above a threshold (about 5000). An app is
+ *      forked by the system zygote, so getppid() IS the zygote's own pid. A
+ *      normal zygote starts early at boot and gets a small pid; after a soft
+ *      restart (zygote restart without a kernel reboot, i.e. temporary root /
+ *      免解) the PID counter is NOT reset, so the re-forked zygote gets a
+ *      large pid and every app's getppid() reports it. The parent is still
+ *      the zygote - this is not injection or re-parenting, the zygote's own
+ *      pid has simply gone abnormal.
  *
  *   2. the Seccomp field in /proc/self/status is 0. Every app process gets a
  *      seccomp filter installed by zygote, so a real app reports 2 (filter
@@ -107,6 +110,9 @@ static unsigned long hide_self_stat_seccomp_seen __read_mostly;
 #define HIDE_SELF_SCAN_MIN_MS	1000
 
 static pid_t hide_self_zygote_pid __read_mostly;
+/* last zygote pid seen in the normal range; kept after a soft restart so
+ * getppid() keeps answering with a believable small number */
+static pid_t hide_self_last_good_zygote __read_mostly;
 static uintptr_t hide_self_init_task;
 
 static struct delayed_work hide_self_work;
@@ -134,19 +140,22 @@ static __always_inline bool hide_self_reader_is_app(void)
 /* ------------------------------------------------------------------------ */
 
 /*
- * The answer handed back to the caller. Returning the real zygote pid is only
- * good enough while that pid is itself small: after a soft restart the new
- * zygote inherits the current pid counter, which by then is far above the
- * 5000 the detector tests for, so answering with the truth would keep failing
- * the check. In that case the answer falls back to 1 (init), which is a real
- * task and what an orphaned process is re-parented to anyway.
+ * The answer handed back to the caller. The detector only requires the parent
+ * pid to be small (< hide_self_ppid_limit), so any believable small value
+ * passes. Prefer the live zygote pid while it is itself in range; once a soft
+ * restart has renumbered zygote above the limit, keep answering with the last
+ * in-range zygote pid we saw, and only fall back to 1 (init, the task a real
+ * orphan is re-parented to) when we have never seen one.
  */
 static __always_inline pid_t hide_self_fake_ppid(void)
 {
 	pid_t z = smp_load_acquire(&hide_self_zygote_pid);
+	pid_t last = smp_load_acquire(&hide_self_last_good_zygote);
 
 	if (z > 0 && z <= hide_self_ppid_limit)
 		return z;
+	if (last > 0 && last <= hide_self_ppid_limit)
+		return last;
 
 	return 1;
 }
@@ -195,11 +204,14 @@ static void hide_self_scan(void)
 
 	if (found != hide_self_zygote_pid) {
 		smp_store_release(&hide_self_zygote_pid, found);
-		pr_info("hide_self: zygote pid %d used as fake parent\n", (int)found);
 
-		if (found > hide_self_ppid_limit)
-			pr_info("hide_self: zygote pid %d is above %d, which is what a warm restart does; getppid() will answer 1 until a full reboot hands zygote a small pid again\n",
-				(int)found, hide_self_ppid_limit);
+		if (found <= hide_self_ppid_limit) {
+			smp_store_release(&hide_self_last_good_zygote, found);
+			pr_info("hide_self: zygote pid %d used as fake parent\n", (int)found);
+		} else {
+			pr_info("hide_self: zygote pid %d is above %d (a soft restart); getppid() keeps answering %d until zygote is back in range\n",
+				(int)found, hide_self_ppid_limit, (int)hide_self_fake_ppid());
+		}
 	}
 }
 
@@ -413,4 +425,5 @@ static void hide_self_exit(void)
 	destroy_kprobe(&kp_seq_decimal);
 
 	smp_store_release(&hide_self_zygote_pid, 0);
+	smp_store_release(&hide_self_last_good_zygote, 0);
 }
