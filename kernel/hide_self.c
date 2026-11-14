@@ -68,6 +68,7 @@
 #include <linux/cred.h>
 #include <linux/jiffies.h>
 #include <linux/pid_namespace.h>
+#include <linux/random.h>
 #include <linux/rcupdate.h>
 #include <linux/rculist.h>
 #include <linux/sched.h>
@@ -113,6 +114,12 @@ static pid_t hide_self_zygote_pid __read_mostly;
 /* last zygote pid seen in the normal range; kept after a soft restart so
  * getppid() keeps answering with a believable small number */
 static pid_t hide_self_last_good_zygote __read_mostly;
+/*
+ * Per-boot random salt for the synthetic parent pid. Drawn once in init so the
+ * mapping pid -> fake ppid cannot be predicted from outside, while staying
+ * identical for the lifetime of the boot.
+ */
+static u32 hide_self_ppid_salt __read_mostly;
 static uintptr_t hide_self_init_task;
 
 static struct delayed_work hide_self_work;
@@ -140,24 +147,56 @@ static __always_inline bool hide_self_reader_is_app(void)
 /* ------------------------------------------------------------------------ */
 
 /*
- * The answer handed back to the caller. The detector only requires the parent
- * pid to be small (< hide_self_ppid_limit), so any believable small value
- * passes. Prefer the live zygote pid while it is itself in range; once a soft
- * restart has renumbered zygote above the limit, keep answering with the last
- * in-range zygote pid we saw, and only fall back to 1 (init, the task a real
- * orphan is re-parented to) when we have never seen one.
+ * The synthetic parent pid handed to the caller.
+ *
+ * Two properties matter, and only the first one is obvious:
+ *
+ *   1. it must be below hide_self_ppid_limit (5000 by default), because that
+ *      is the only value the getppid() check tests;
+ *
+ *   2. it must be STABLE for a given process. The real getppid() returns the
+ *      same number every time it is called by the same task - the parent does
+ *      not change between two instructions. A value that changes per call is
+ *      trivially detectable with
+ *
+ *          a = getppid(); b = getppid();
+ *          if (a != b) -> "this syscall is hooked"
+ *
+ *      which is a far louder and cheaper signal than a large pid, so a fresh
+ *      random number per call would make the module easier to catch, not
+ *      harder.
+ *
+ * So the value is derived from the task's own pid mixed with a per-boot salt:
+ * stable for the process, different between processes, and not predictable
+ * from userspace because the salt is drawn once at load time.
+ *
+ * The result is mapped into [1, limit-1]. Never 0 (no task has pid 0) and
+ * never the limit itself, so the answer always passes a strict < test.
  */
-static __always_inline pid_t hide_self_fake_ppid(void)
+static __always_inline pid_t hide_self_fake_ppid_for(pid_t self_pid)
 {
-	pid_t z = smp_load_acquire(&hide_self_zygote_pid);
-	pid_t last = smp_load_acquire(&hide_self_last_good_zygote);
+	u32 salt = smp_load_acquire(&hide_self_ppid_salt);
+	u32 span;
+	u32 h;
 
-	if (z > 0 && z <= hide_self_ppid_limit)
-		return z;
-	if (last > 0 && last <= hide_self_ppid_limit)
-		return last;
+	if (hide_self_ppid_limit <= 1)
+		return 1;
 
-	return 1;
+	/* usable range is [1, limit-1] */
+	span = (u32)(hide_self_ppid_limit - 1);
+
+	/* cheap integer avalanche so neighbouring pids do not map to
+	 * neighbouring parent pids (which would itself look synthetic) */
+	h = (u32)self_pid * 2654435761u;
+	h ^= salt;
+	h ^= h >> 16;
+	h *= 2246822519u;
+	h ^= h >> 13;
+	h *= 3266489917u;
+	h ^= h >> 16;
+
+	/* 1 + [0, span-1] keeps the result inside [1, limit-1] */
+	return (pid_t)(1u + (h % span));
 }
 
 static bool hide_self_is_zygote(const char *comm)
@@ -209,8 +248,8 @@ static void hide_self_scan(void)
 			smp_store_release(&hide_self_last_good_zygote, found);
 			pr_info("hide_self: zygote pid %d used as fake parent\n", (int)found);
 		} else {
-			pr_info("hide_self: zygote pid %d is above %d (a soft restart); getppid() keeps answering %d until zygote is back in range\n",
-				(int)found, hide_self_ppid_limit, (int)hide_self_fake_ppid());
+			pr_info("hide_self: zygote pid %d is above %d (a soft restart); getppid() will report a synthetic parent below %d\n",
+				(int)found, hide_self_ppid_limit, hide_self_ppid_limit);
 		}
 	}
 }
@@ -239,13 +278,17 @@ static int hide_self_kr_getppid_ret(struct kretprobe_instance *ri, struct pt_reg
 {
 	long ret = (long)regs->regs[0];
 
+	/* only an already oversized answer is replaced; a small one is what a
+	 * healthy zygote looks like and needs no help */
 	if (ret <= (long)hide_self_ppid_limit)
 		return 0;
 
 	if (!hide_self_reader_is_app())
 		return 0;
 
-	regs->regs[0] = (unsigned long)hide_self_fake_ppid();
+	/* the value must be stable per process: it is derived from the caller's
+	 * own pid, not redrawn per call */
+	regs->regs[0] = (unsigned long)hide_self_fake_ppid_for(current->pid);
 
 	return 0;
 }
@@ -269,6 +312,22 @@ static const char hide_self_ppid_key[] = "\nPPid:\t";
 static const char hide_self_seccomp_key[] = "\nSeccomp:\t";
 static const char hide_self_filters_key[] = "\nSeccomp_filters:\t";
 
+/*
+ * Bounded compare against a delimiter we know the length of.
+ *
+ * seq_put_decimal_ull() is called with many different delimiters, and the
+ * pointer comes straight out of the caller's registers. strcmp() would read
+ * until it found a NUL, i.e. unbounded - a caller passing anything other than
+ * a short literal (a non-terminated buffer, a different format) turns a probe
+ * into an out-of-bounds read in the middle of /proc output. Comparing a fixed
+ * number of bytes and then requiring the NUL keeps the probe read-only and
+ * in-bounds no matter what the caller passed.
+ */
+static __always_inline bool hide_self_delim_is(const char *delim, const char *key, size_t len)
+{
+	return !strncmp(delim, key, len) && delim[len] == '\0';
+}
+
 static int hide_self_kp_seq_decimal_pre(struct kprobe *unused, struct pt_regs *regs)
 {
 	const char *delim;
@@ -287,7 +346,8 @@ static int hide_self_kp_seq_decimal_pre(struct kprobe *unused, struct pt_regs *r
 		return 0;
 
 	/* both keys start with one newline, and only two second bytes exist */
-	if (!strcmp(delim, hide_self_ppid_key)) {
+	if (hide_self_delim_is(delim, hide_self_ppid_key,
+			       sizeof(hide_self_ppid_key) - 1)) {
 		num = (unsigned long long)PT_REGS_PARM3(regs);
 		if (hide_self_debug)
 			hide_self_stat_ppid_seen++;
@@ -296,13 +356,14 @@ static int hide_self_kp_seq_decimal_pre(struct kprobe *unused, struct pt_regs *r
 			return 0;
 		if (!num || num <= (unsigned long long)hide_self_ppid_limit)
 			return 0;
-		PT_REGS_PARM3(regs) = (unsigned long)hide_self_fake_ppid();
+		PT_REGS_PARM3(regs) = (unsigned long)hide_self_fake_ppid_for(current->pid);
 		if (hide_self_debug)
 			hide_self_stat_ppid++;
 		return 0;
 	}
 
-	if (!strcmp(delim, hide_self_seccomp_key)) {
+	if (hide_self_delim_is(delim, hide_self_seccomp_key,
+			       sizeof(hide_self_seccomp_key) - 1)) {
 		num = (unsigned long long)PT_REGS_PARM3(regs);
 		if (hide_self_debug)
 			hide_self_stat_seccomp_seen++;
@@ -314,7 +375,8 @@ static int hide_self_kp_seq_decimal_pre(struct kprobe *unused, struct pt_regs *r
 		return 0;
 	}
 
-	if (!strcmp(delim, hide_self_filters_key)) {
+	if (hide_self_delim_is(delim, hide_self_filters_key,
+			       sizeof(hide_self_filters_key) - 1)) {
 		if ((unsigned long long)PT_REGS_PARM3(regs))
 			return 0;
 		PT_REGS_PARM3(regs) = 1;	/* one filter installed */
@@ -379,6 +441,13 @@ static __init int hide_self_init(void)
 		hide_self_scan_ms = HIDE_SELF_SCAN_MIN_MS;
 	}
 
+	/*
+	 * Drawn once per load so the pid -> fake-ppid mapping is not a fixed
+	 * function an observer could reproduce, while staying constant for the
+	 * boot so a given process always gets the same answer.
+	 */
+	smp_store_release(&hide_self_ppid_salt, get_random_u32());
+
 	hide_self_scan();
 
 	kr_getppid = hide_self_arm_ret("__arm64_sys_getppid",
@@ -406,9 +475,8 @@ static __init int hide_self_init(void)
 				      msecs_to_jiffies((unsigned int)hide_self_period));
 	}
 
-	pr_info("hide_self: %d hook(s) armed, fake parent pid %d, ppid limit %d, status ppid %d\n",
-		armed, (int)hide_self_fake_ppid(), hide_self_ppid_limit,
-		hide_self_status_ppid);
+	pr_info("hide_self: %d hook(s) armed, synthetic parent pid in [1,%d], status ppid %d\n",
+		armed, hide_self_ppid_limit - 1, hide_self_status_ppid);
 
 	return armed ? 0 : -ENODEV;
 }
