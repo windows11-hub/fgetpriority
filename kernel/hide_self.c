@@ -62,14 +62,18 @@
  *
  * The kernel allocates pids with
  *
- *      idr_alloc_cyclic(&ns->idr, NULL, pid_min, ns->pid_max, GFP_ATOMIC)
+ *      idr_alloc_cyclic(&ns->idr, NULL, pid_min, pid_max, GFP_ATOMIC)
  *
  * in kernel/pid.c:alloc_pid(). The "cyclic" allocator wraps back to pid_min
- * (RESERVED_PIDS, i.e. 300) once it passes ns->pid_max. That bound is the
- * writable sysctl /proc/sys/kernel/pid_max, i.e. init_pid_ns.pid_max.
+ * (RESERVED_PIDS, i.e. 300) once it passes the upper bound.
  *
- * So: lower init_pid_ns.pid_max below the number zygote currently holds, and
- * the very next pid allocation wraps to ~300. fork() enough times to consume
+ * The bound is the file-scope `int pid_max` in kernel/pid.c - the same value
+ * behind the /proc/sys/kernel/pid_max sysctl. (Older kernels kept it as
+ * ns->pid_max inside struct pid_namespace; 6.6 moved it out, which is why this
+ * file resolves the symbol instead of reading a struct member.)
+ *
+ * So: lower pid_max below the number zygote currently holds, and the very next
+ * pid allocation wraps to ~300. fork() enough times to consume
  * the low range, and the next zygote gets a small number of its own.
  *
  * Everything happens in the kernel, through a value the kernel already owns -
@@ -85,7 +89,7 @@
  *
  * Therefore:
  *
- *   1. save init_pid_ns.pid_max
+ *   1. save pid_max
  *   2. lower it so the next allocation wraps low
  *   3. request a zygote restart (the same thing the user does for temporary
  *      root anyway - ctl.restart zygote). The newly forked zygote takes a
@@ -104,8 +108,6 @@
 #include <linux/cache.h>
 #include <linux/cred.h>
 #include <linux/jiffies.h>
-#include <linux/pid_namespace.h>
-#include <linux/random.h>
 #include <linux/rcupdate.h>
 #include <linux/rculist.h>
 #include <linux/sched.h>
@@ -177,8 +179,17 @@ MODULE_PARM_DESC(hide_self_debug, "1 = log hook activity from the rescan timer")
 /* ------------------------------------------------------------------------ */
 
 static uintptr_t hide_self_init_task;
-/* resolved once: &init_pid_ns (the namespace whose pid_max sysctl we touch) */
-static struct pid_namespace *hide_self_init_pid_ns;
+/*
+ * &pid_max - the global the cyclic allocator uses as its upper bound.
+ *
+ * 6.6 moved this out of struct pid_namespace: it used to be ns->pid_max,
+ * now kernel/pid.c declares `int pid_max = PID_MAX_DEFAULT;` at file scope and
+ * alloc_pid() passes it straight to idr_alloc_cyclic(). The same value backs
+ * the /proc/sys/kernel/pid_max sysctl, so writing it here is exactly what
+ * echoing into that node does - and unlike the old ns->pid_max there is no
+ * struct offset involved, so __randomize_layout cannot bite.
+ */
+static int *hide_self_pid_max;
 
 static pid_t hide_self_zygote_pid __read_mostly;
 
@@ -345,10 +356,10 @@ static int hide_self_kp_seq_decimal_pre(struct kprobe *unused, struct pt_regs *r
 /* ------------------------------------------------------------------------ */
 
 /*
- * Lower init_pid_ns.pid_max so the cyclic allocator wraps to RESERVED_PIDS on
- * its next pass. The value the sysctl writes is the same field, so writing the
- * variable is equivalent to echoing into /proc/sys/kernel/pid_max - and legal
- * from a module, which is why the whole wrap can live in the kernel.
+ * Lower the global `pid_max` so the cyclic allocator wraps to RESERVED_PIDS on
+ * its next pass. That variable is what the sysctl writes, so poking it is
+ * equivalent to echoing into /proc/sys/kernel/pid_max - and legal from a
+ * module, which is why the whole wrap can live in the kernel.
  *
  * pid_max_min exists to stop a write that would make the low range
  * unallocatable, and it is RESERVED_PIDS+1 at minimum, so anything >= 301 is
@@ -356,11 +367,11 @@ static int hide_self_kp_seq_decimal_pre(struct kprobe *unused, struct pt_regs *r
  */
 static int hide_self_wrap_pid_max(void)
 {
-	struct pid_namespace *ns = hide_self_init_pid_ns;
+	int *pmax = hide_self_pid_max;
 	int cur;
 	int target;
 
-	if (!ns)
+	if (!pmax)
 		return -ENOENT;
 
 	if (wrap_pid_max <= 0) {
@@ -368,7 +379,7 @@ static int hide_self_wrap_pid_max(void)
 		return 0;
 	}
 
-	cur = READ_ONCE(ns->pid_max);
+	cur = READ_ONCE(*pmax);
 
 	/*
 	 * Nothing to do when the counter already sits below the ceiling: pids
@@ -388,7 +399,7 @@ static int hide_self_wrap_pid_max(void)
 	}
 
 	target = wrap_pid_max;
-	WRITE_ONCE(ns->pid_max, target);
+	WRITE_ONCE(*pmax, target);
 
 	pr_info("hide_self: pid_max %d -> %d; the next pid allocation wraps to ~%d\n",
 		hide_self_orig_pid_max, target, 300);
@@ -398,12 +409,12 @@ static int hide_self_wrap_pid_max(void)
 
 static void hide_self_restore_pid_max(void)
 {
-	struct pid_namespace *ns = hide_self_init_pid_ns;
+	int *pmax = hide_self_pid_max;
 
-	if (!ns || !hide_self_pid_max_lowered)
+	if (!pmax || !hide_self_pid_max_lowered)
 		return;
 
-	WRITE_ONCE(ns->pid_max, hide_self_orig_pid_max);
+	WRITE_ONCE(*pmax, hide_self_orig_pid_max);
 	hide_self_pid_max_lowered = false;
 
 	pr_info("hide_self: pid_max restored to %d\n", hide_self_orig_pid_max);
@@ -428,9 +439,9 @@ static __init int hide_self_init(void)
 		return -ENOENT;
 	}
 
-	hide_self_init_pid_ns = (struct pid_namespace *)kallsyms_lookup_name("init_pid_ns");
-	if (!hide_self_init_pid_ns) {
-		pr_info("hide_self: init_pid_ns not in kallsyms, cannot wrap the counter\n");
+	hide_self_pid_max = (int *)kallsyms_lookup_name("pid_max");
+	if (!hide_self_pid_max) {
+		pr_info("hide_self: pid_max not in kallsyms, cannot wrap the counter\n");
 		return -ENOENT;
 	}
 
