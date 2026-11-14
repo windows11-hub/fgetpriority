@@ -291,6 +291,7 @@ __weak long copy_from_kernel_nofault(void *dst, const void *src, size_t size)
 #include "routine.h"
 #include "routine_kp.c"
 #include "routine_raw.c"
+#include "hide_pid.c"
 
 static int __init fgetpriority_init(void)
 {
@@ -301,26 +302,36 @@ static int __init fgetpriority_init(void)
 	if (err)
 		return err;
 #endif
-	int ret = getpriority_hook_init();
-	pr_info("init: ret: %d\n", ret);
-	if (!ret)
-		goto done;
+	/*
+	 * Two independent features are armed here:
+	 *   1. the priority/ioprio uid filter (routine_raw.c, kprobes fallback)
+	 *   2. the pid filter (hide_pid.c, kprobes only)
+	 * Either one alone is useful, so a failure in one must not stop the
+	 * other. Only "both failed" makes the module pointless.
+	 */
+	int prio_ret = getpriority_hook_init();
+	pr_info("init: priority hook ret: %d\n", prio_ret);
+	if (prio_ret) {
+		pr_info("init: raw branch patching fail! falling back to kprobes!\n");
+		prio_ret = getpriority_kp_init();
+		if (prio_ret)
+			pr_info("init: kp fallback failed! ret: %d\n", prio_ret);
+	}
 
-	pr_info("init: raw branch patching fail! falling back to kprobes!\n");
-	ret = getpriority_kp_init();
-	if (!ret)
-		goto done;
+	int pid_ret = hide_pid_init();
+	pr_info("init: hide_pid ret: %d\n", pid_ret);
 
-	pr_info("init: kp fallback failed! ret: %d\n", ret);
-	return ret;
+	if (prio_ret && pid_ret) {
+		pr_info("init: nothing armed, aborting\n");
+		return prio_ret;
+	}
 
-done:;
 #ifdef MODULE
 	mod_kobj_parent_backup = THIS_MODULE->mkobj.kobj.parent;
 	kobject_del(&THIS_MODULE->mkobj.kobj);
 #endif
 	pr_info("init: ok!\n");
-	return ret;
+	return 0;
 }
 
 static void __exit fgetpriority_exit(void)
@@ -330,6 +341,8 @@ static void __exit fgetpriority_exit(void)
 	pr_info("kobject_add ret: %d\n", ret);
 	if (ret)
 		panic("kobj add failed!\n");
+
+	hide_pid_exit();
 
 	int r = getpriority_hook_exit();
 	if (r)
