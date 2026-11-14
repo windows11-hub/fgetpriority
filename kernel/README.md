@@ -34,12 +34,10 @@ Usage (built-in):
 | name | default | meaning |
 | --- | --- | --- |
 | `kallsyms_lookup_name_fn` | 0 | address to use when /proc/kallsyms is unreadable |
-| `hide_comm_list` | `ksud` | comma separated `struct task_struct.comm` names to hide |
+| `hide_comm_list` | empty | comma separated `struct task_struct.comm` names to hide. **Empty hides nothing**, so a bare `insmod` is inert |
 | `hide_scan_ms` | `1000` | rescan interval for re-locating the pid, `0` disables rescanning |
 | `hide_only_from_app` | `1` | `1` = hide only from app-uid callers, `0` = hide from every caller |
 | `hide_module_name` | empty | if set, the name `/proc/modules` reports instead of the real one |
-| `hide_zygote_abnormal` | `1` | `1` = also hide a zygote whose pid is above `hide_zygote_pid_limit` (temporary root), `0` = leave it |
-| `hide_zygote_pid_limit` | `5000` | pid threshold above which a zygote is treated as soft-restarted |
 
 ```shell
 insmod fgetpriority.ko hide_comm_list="ksud,ksud_watch" hide_scan_ms=500
@@ -54,8 +52,8 @@ milliseconds. A single-pid tracker latches onto one of those, publishes it, and
 then loses the daemon when the client exits - which leaves the daemon visible
 until the next scan. The whole set is published as one immutable snapshot
 behind an RCU pointer, sized to exactly the number of matches - there is no
-fixed cap, so a soft restart that leaves zygote plus several same-comm
-children behind all get hidden. Readers in kprobe context take
+fixed cap, so a soft restart that leaves several same-comm `ksud` processes
+behind all get hidden. Readers in kprobe context take
 rcu_read_lock() and dereference the pointer; a writer allocates a fresh
 snapshot and frees the old one through call_rcu().
 
@@ -102,6 +100,32 @@ dmesg | grep 'hide_pid:'
 If `hide_comm_list` names the wrong comm, the module stays armed and silently
 hides nothing; check that first when the detector still sees the process
 (`cat /proc/<pid>/comm`).
+
+## Safety design
+
+These are deliberate constraints, not implementation details. Each one exists
+because violating it makes the device unbootable rather than merely wrong.
+
+| constraint | why |
+| --- | --- |
+| empty `hide_comm_list` hides nothing | a default or a typo can never be the thing that breaks a boot; hiding is always explicit |
+| kernel threads are never matched (`!p->mm`) | a kernel thread has no address space; hiding one loses it from workqueue/scheduler bookkeeping, which panics the device |
+| system-critical comms are refused in-kernel and in service.sh | `zygote`, `system_server`, `init`, `surfaceflinger`, `usap*` are pids the framework must resolve; hiding them makes every app unlaunchable |
+| hard ceiling on the tracked set | the snapshot is sized to the match count; an unbounded match would request an arbitrarily large allocation on every rescan |
+| `rcu_barrier()` on unload | `hide_publish()` queues `call_rcu()` callbacks that live in module text; `synchronize_rcu()` alone does not run them, so unloading would leave a callback that executes freed kernel text |
+
+### Do not list system-critical processes
+
+`hide_comm_list` must never contain `zygote`, `system_server`, `init`,
+`surfaceflinger` or any other process the framework resolves pids for. The
+filter answers `ESRCH`/`ENOENT` to `/proc/<pid>`, `kill`, `waitid` and every
+pid -> task lookup, so hiding one of those breaks process management: hiding
+zygote in particular makes every app unlaunchable, because apps are forked
+from it and system_server has to resolve and reap those pids.
+
+The zygote part of the temporary-root signal is handled in `hide_self.c` by
+spoofing `getppid()` and the `PPid`/`Seccomp` fields of `/proc/self/status`;
+zygote itself must stay visible.
 
 ## Compatibility
 
