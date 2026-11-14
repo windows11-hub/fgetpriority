@@ -178,7 +178,7 @@ static __always_inline bool hide_self_reader_is_app(void)
  * The result is mapped into [1, limit-1]. Never 0 (no task has pid 0) and
  * never the limit itself, so the answer always passes a strict < test.
  */
-static __always_inline pid_t hide_self_fake_ppid_for(pid_t self_pid)
+static __always_inline pid_t hide_self_fake_ppid_for(pid_t real_ppid)
 {
 	u32 salt = smp_load_acquire(&hide_self_ppid_salt);
 	u32 span;
@@ -192,7 +192,7 @@ static __always_inline pid_t hide_self_fake_ppid_for(pid_t self_pid)
 
 	/* cheap integer avalanche so neighbouring pids do not map to
 	 * neighbouring parent pids (which would itself look synthetic) */
-	h = (u32)self_pid * 2654435761u;
+	h = (u32)real_ppid * 2654435761u;
 	h ^= salt;
 	h ^= h >> 16;
 	h *= 2246822519u;
@@ -322,22 +322,26 @@ static void hide_self_scan(void)
 
 	if (found != hide_self_zygote_pid) {
 		/*
-		 * The tracked zygote changed, so this is a new generation: record the
-		 * pid and redraw the salt, so the synthetic parents handed out after a
-		 * soft restart are unrelated to the ones handed out before it.
+		 * The tracked zygote changed (soft restart, zygote crash).
 		 *
-		 * Order matters. The salt is published first, then the pid, so a
-		 * concurrent getppid() either sees the old salt with the old pid or
-		 * the new salt with the new pid - never the previous generation's salt
-		 * applied to the next generation's pid.
+		 * The salt is deliberately NOT redrawn here. getppid() must be a pure
+		 * function of the real parent pid: if the mapping changed underneath a
+		 * running process, that process's answer would change while its parent
+		 * did not - an orphan stays reparented to init(1) for the rest of its
+		 * life, yet it would suddenly report a different number than a moment
+		 * ago. Two consecutive reads disagreeing is the cheapest possible
+		 * hook check, far cheaper than the mapping table an attacker would
+		 * need to exploit a stable salt.
+		 *
+		 * So the salt is drawn once at load and left alone; the pid is only
+		 * recorded for logging and for last_good_zygote.
 		 */
-		smp_store_release(&hide_self_ppid_salt, hide_self_draw_salt());
 		smp_store_release(&hide_self_zygote_pid, found);
 
 		if (found <= hide_self_ppid_limit)
 			smp_store_release(&hide_self_last_good_zygote, found);
 
-		pr_info("hide_self: zygote pid %d recorded, salt redrawn; getppid() reports a synthetic parent in [1,%d]\n",
+		pr_info("hide_self: zygote pid %d recorded; getppid() reports a synthetic parent in [1,%d]\n",
 			(int)found, hide_self_ppid_limit - 1);
 	}
 }
@@ -374,9 +378,24 @@ static int hide_self_kr_getppid_ret(struct kretprobe_instance *ri, struct pt_reg
 	if (!hide_self_reader_is_app())
 		return 0;
 
-	/* the value must be stable per process: it is derived from the caller's
-	 * own pid, not redrawn per call */
-	regs->regs[0] = (unsigned long)hide_self_fake_ppid_for(current->pid);
+	/*
+	 * `ret` IS the real parent pid, so map it - not the caller's own pid.
+	 *
+	 * Mapping the caller introduced two contradictions that a consistency
+	 * check catches immediately:
+	 *
+	 *  - every app under the same zygote has the same parent, so every app
+	 *    must report the same ppid; hashing the caller made each app report a
+	 *    different one, which no real system does;
+	 *  - two threads of one process would get two different parents, and
+	 *    current->pid is the *thread* id, so getppid() and the PPid field of
+	 *    /proc/self/status disagreed for the same process.
+	 *
+	 * Hashing the real parent fixes both: the answer depends only on which
+	 * zygote forked the caller, so it is identical across siblings, threads
+	 * and both read paths, and still stable for the process lifetime.
+	 */
+	regs->regs[0] = (unsigned long)hide_self_fake_ppid_for((pid_t)ret);
 
 	return 0;
 }
@@ -444,7 +463,9 @@ static int hide_self_kp_seq_decimal_pre(struct kprobe *unused, struct pt_regs *r
 			return 0;
 		if (!num || num <= (unsigned long long)hide_self_ppid_limit)
 			return 0;
-		PT_REGS_PARM3(regs) = (unsigned long)hide_self_fake_ppid_for(current->pid);
+		/* `num` is the real ppid, so this resolves to the same value the
+		 * getppid() hook returns for the same parent - the two paths must agree */
+		PT_REGS_PARM3(regs) = (unsigned long)hide_self_fake_ppid_for((pid_t)num);
 		if (hide_self_debug)
 			hide_self_stat_ppid++;
 		return 0;
