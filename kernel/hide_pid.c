@@ -7,143 +7,59 @@
  * published by the Free Software Foundation.
  *
  */
+
 /*
- * hide_pid.c - hide one userspace process (default: "ksud") from every path
- * that turns a pid number into a task, from /proc/<pid>, and from the /proc
- * directory listing itself.
+ * hide_self.c - spoof the two self checks behind "Found ksu ..." detection.
  *
- * Unity built: main.c includes this file after arch.h, routine.h and
- * routine_kp.c, so PT_REGS_*, init_kprobe()/destroy_kprobe(), the
- * kallsyms_lookup_name() override and MIN_APP_PROCESS_UID are all in scope.
- * It is NOT a standalone translation unit and must stay below those includes.
+ * The detector decides this one from inside its own process, without
+ * touching the package manager, /data/adb or /proc/fs (its own docs say so
+ * explicitly). Two readings are used, and either one is enough to fail:
  *
- * ===========================================================================
- * 1. WHERE A PID TURNS INTO A TASK
+ *   1. getppid() returns a pid above a threshold (about 5000). An app is
+ *      forked by the system zygote, so getppid() IS the zygote's own pid. A
+ *      normal zygote starts early at boot and gets a small pid; after a soft
+ *      restart (zygote restart without a kernel reboot, i.e. temporary root /
+ *      免解) the PID counter is NOT reset, so the re-forked zygote gets a
+ *      large pid and every app's getppid() reports it. The parent is still
+ *      the zygote - this is not injection or re-parenting, the zygote's own
+ *      pid has simply gone abnormal.
  *
- * Every syscall that accepts a pid ends up in one of these kernel/pid.c
- * primitives:
+ *   2. the Seccomp field in /proc/self/status is 0. Every app process gets a
+ *      seccomp filter installed by zygote, so a real app reports 2 (filter
+ *      mode). 0 means no filter was ever installed.
  *
- *     struct pid *find_pid_ns(int nr, struct pid_namespace *ns)
- *             return idr_find(&ns->idr, nr);
+ * Both are answered by the kernel, so both can be answered differently here.
  *
- *     struct task_struct *find_task_by_pid_ns(int nr, struct pid_namespace *ns)
- *             return pid_task(find_pid_ns(nr, ns), PIDTYPE_PID);
+ *   - getppid is a kretprobe: the return value lives in x0 when the syscall
+ *     wrapper returns. A plain kprobe would not do - its handler runs at the
+ *     first instruction of the function, long before there is a value.
+ *     Only an already oversized answer is replaced, so ordinary processes
+ *     keep seeing the truth.
  *
- *     struct pid *find_ge_pid(int nr, struct pid_namespace *ns)
- *             smallest existing pid >= nr, used to walk /proc
+ *   - the status text is produced by fs/proc/array.c, and the piece we care
+ *     about goes through seq_put_decimal_ull(m, "\nSeccomp:\t", mode).
+ *     That function is exported and therefore probeable. The delimiter
+ *     string identifies the field, so the pre handler rewrites the value
+ *     argument before it is formatted. Keying on the delimiter avoids
+ *     hard-coding any address inside a static inline helper that the
+ *     compiler may have inlined anywhere.
  *
- * The two wrapper functions the syscalls actually call are find_vpid() and
- * find_task_by_vpid(); both are thin inlines over find_pid_ns() and
- * find_task_by_pid_ns() respectively. So three kprobes cover everything:
+ * The fake parent pid is the real zygote, located by the same task list
+ * walk that hide_pid.c uses, and refreshed on a timer so a soft reboot or a
+ * zygote restart does not leave a stale number behind.
  *
- *   find_pid_ns            kill, tkill, tgkill, rt_sigqueueinfo,
- *                          rt_tgsigqueueinfo, pidfd_open, pidfd_getfd, waitid
- *   find_task_by_pid_ns    sched_{get,set}{affinity,param,scheduler,attr},
- *                          getpriority, setpriority, ioprio_{get,set},
- *                          getpgid, getsid, prlimit64, get_robust_list,
- *                          set_robust_list, ptrace, kcmp, migrate_pages,
- *                          move_pages, process_vm_readv, process_vm_writev,
- *                          getrusage(who), setns, and /proc/<pid> itself
- *   find_ge_pid            the readdir("/proc") iterator (next_tgid)
+ * The "PPid" line of the same status file is spoofed the same way, because
+ * otherwise getppid() and /proc/self/status would disagree, and that
+ * disagreement is itself a fingerprint.
  *
- * Patching individual syscall entry points instead (what routine_raw.c does
- * for find_user) is not viable here: dozens of syscalls take a pid and that
- * list moves between kernel versions.
- *
- * ===========================================================================
- * 2. WHY A KPROBE RATHER THAN A BRANCH PATCH
- *
- * Rewriting the first instruction of find_pid_ns with "b hook" would need the
- * hook within +/-128MB of core kernel text (routine_raw.c already bails with
- * -ERANGE past that), would destroy the "bti c" landing pad GKI requires for
- * indirect calls, and would race ftrace over the patchable prologue. A kprobe
- * swaps one instruction through text_poke(), is always reachable and reverts
- * cleanly. GKI ships CONFIG_KPROBES=y.
- *
- * A pre_handler cannot synthesise a return value, so it rewrites the
- * *argument*: nr becomes a value above PID_MAX_LIMIT that can never exist in
- * the idr, the real function then misses its own lookup and returns NULL.
- * Callers see a plain "no such process". Same trick routine_kp.c plays with
- * the uid.
- *
- * ===========================================================================
- * 3. WHY find_ge_pid IS HOOKED TOO
- *
- * Hooking only the two resolvers leaves an inconsistency worse than the
- * original problem: readdir("/proc") would still emit ksud's number, and
- * every attempt to stat()/open() that entry would fail with ENOENT. "Listed
- * by readdir but never resolvable" is a far stronger anomaly signal than a
- * perfectly ordinary process the detector can see. So the iterator is hooked
- * as well: when it asks for the hidden number, it is bumped to the next one
- * and the entry never appears. /proc becomes internally consistent - the
- * process is simply not there.
- *
- * ===========================================================================
- * 4. WHAT A DETECTOR SEES ONCE THIS IS ARMED
- *
- *     kill(ksud, 0) / tgkill(ksud, ...)       -> -1 ESRCH
- *     pidfd_open(ksud, 0)                     -> -1 ESRCH
- *     sched_getaffinity(ksud, ...)            -> -1 ESRCH
- *     getpriority(PRIO_PROCESS, ksud)         -> -1 ESRCH
- *     ptrace(PTRACE_ATTACH, ksud)             -> -1 ESRCH
- *     process_vm_readv(ksud, ...)             -> -1 ESRCH
- *     stat("/proc/<ksud>")                    -> -1 ENOENT
- *     open("/proc/<ksud>/cmdline")            -> -1 ENOENT
- *     readdir("/proc")                        -> ksud's number is absent
- *
- * ===========================================================================
- * 5. WHO IS FILTERED (hide_only_from_app)
- *
- * By default the filter only applies to callers that look like a sandboxed
- * app: uid >= MIN_APP_PROCESS_UID and TIF_SECCOMP set (zygote installs a
- * seccomp filter into every app). Root, init, system_server and kernel
- * threads keep the true view, so "ps" from adb shell, ActivityManager's own
- * bookkeeping and this module's service.sh all keep working. Set
- * hide_only_from_app=0 to hide the pid from every caller, which is stronger
- * but also blinds your own tooling.
- *
- * ===========================================================================
- * 6. SOFT REBOOT
- *
- * A soft reboot (zygote or system_server restart - the kernel stays up) gives
- * ksud a brand new pid while the hooks remain armed. The hooks never cache a
- * task, only compare against the published pid set, and a delayed work item
- * walks init_task.tasks every hide_scan_ms milliseconds collecting every
- * group leader whose comm matches hide_comm_list. The set is republished
- * through a seqlock, so a handler sees either the whole old set or the whole
- * new one. The exposure window after a respawn is therefore at most one scan
- * interval (default 1000ms; hide_scan_ms=0 disables rescanning).
- *
- * The set matters: every "ksud ..." command line is a second process with the
- * same comm that lives for milliseconds. Tracking a single pid would latch
- * onto such a client and then lose the daemon when that client exits.
- *
- * If no process matches any more the set is emptied, so a recycled pid number
- * belonging to an unrelated process is never hidden.
- *
- * ===========================================================================
- * 7. KNOWN GAPS (by design, not bugs)
- *
- *  - Table-wide walks that never name a pid are untouched: kill(-1, 0) still
- *    returns 0. getpriority(PRIO_USER, uid), the channel the 鏄ョ detector uses
- *    for its "hidden app list" check, is already handled by routine_raw.c.
- *  - Thread ids are not filtered; the match key is the group leader pid, which
- *    is what task_pid_nr()/ps show.
- *  - A nested pid namespace (container) numbers pids differently; the filter
- *    only matches ns->level == 0, so it does not apply there.
- *  - Anything that resolved /proc/<pid>/... before the module was loaded keeps
- *    that already-open reference. Nothing can retroactively take it away.
- *  - hide_only_from_app uses uid >= 10000. A detector running as a plain
- *    foreground shell (uid 2000) is not filtered.
- *
- * ===========================================================================
- * 8. RISK: these are warm code paths
- *
- * find_pid_ns() and find_task_by_pid_ns() are on a large fraction of syscalls,
- * and each matching hit costs a trap into the kprobe handler. The handler
- * itself is three comparisons, but the trap is real. If the regression
- * matters more than the coverage, keep only find_task_by_pid_ns (covers
- * /proc and the sched_* and priority families) and drop the other two.
+ * Known gaps:
+ *   - /proc/self/stat field 4 (ppid) is still the real value. The delimiter
+ *     there is a bare space shared by every other field of that file, so it
+ *     cannot be told apart without hooking do_task_stat itself.
+ *   - a reader with uid below 10000 (root, shell, init, system_server) is
+ *     left alone on purpose, so ps, dumpsys and a root shell keep working.
+ *   - the spoofing is keyed on the reader being an app. Reading another
+ *     process status from an app is spoofed as well; that is deliberate.
  */
 
 #include <asm/barrier.h>
@@ -151,257 +67,161 @@
 #include <linux/cache.h>
 #include <linux/cred.h>
 #include <linux/jiffies.h>
-#include <linux/pid.h>
 #include <linux/pid_namespace.h>
 #include <linux/rcupdate.h>
 #include <linux/rculist.h>
 #include <linux/sched.h>
 #include <linux/workqueue.h>
 
-/* above PID_MAX_LIMIT (4 * 1024 * 1024), so any idr lookup is guaranteed to miss */
-#define HIDE_ABSENT_PID		0x40000000
+/* anything above this is replaced by the real zygote pid */
+static int hide_self_ppid_limit = 5000;
+module_param(hide_self_ppid_limit, int, 0444);
+MODULE_PARM_DESC(hide_self_ppid_limit, "replace getppid() results above this value (default: 5000)");
+
+/* 0 turns the zygote lookup timer off; the last known pid keeps being used */
+static int hide_self_scan_ms = 5000;
+module_param(hide_self_scan_ms, int, 0444);
+MODULE_PARM_DESC(hide_self_scan_ms, "zygote re-lookup interval in ms, 0 disables the timer");
+
+static int hide_self_seccomp = 1;
+module_param(hide_self_seccomp, int, 0444);
+MODULE_PARM_DESC(hide_self_seccomp, "1 = report Seccomp: 2 to app readers, 0 = leave untouched");
+
+/* the PPid line of /proc/self/status, the sibling of getppid() */
+static int hide_self_status_ppid = 1;
+module_param(hide_self_status_ppid, int, 0444);
+MODULE_PARM_DESC(hide_self_status_ppid, "1 = rewrite the PPid line of status to app readers, 0 = leave untouched");
 
 /*
- * hide_refresh() walks the full task list, so an absurdly small interval would
- * burn CPU on a device with hundreds of processes. Anything below this is
- * clamped rather than honoured.
+ * Diagnostics. A kprobe that never fires is indistinguishable from one that
+ * fires and decides not to rewrite anything, so the timer reports what it
+ * saw. Off by default: it is three increments per call on a hot path.
  */
-#define HIDE_SCAN_MIN_MS	250
+static int hide_self_debug;
+module_param(hide_self_debug, int, 0444);
+MODULE_PARM_DESC(hide_self_debug, "1 = log hook activity from the rescan timer");
 
-static char *hide_comm_list = "ksud";
-module_param(hide_comm_list, charp, 0444);
-MODULE_PARM_DESC(hide_comm_list, "comma separated comm names to hide (default: ksud)");
+static unsigned long hide_self_stat_calls __read_mostly;
+static unsigned long hide_self_stat_ppid __read_mostly;
+static unsigned long hide_self_stat_seccomp __read_mostly;
+static unsigned long hide_self_stat_ppid_seen __read_mostly;
+static unsigned long hide_self_stat_seccomp_seen __read_mostly;
 
-static int hide_scan_ms = 1000;
-module_param(hide_scan_ms, int, 0444);
-MODULE_PARM_DESC(hide_scan_ms, "rescan interval in ms used to re-locate the target, 0 disables rescan");
+#define HIDE_SELF_SCAN_MIN_MS	1000
 
-static int hide_only_from_app = 1;
-module_param(hide_only_from_app, int, 0444);
-MODULE_PARM_DESC(hide_only_from_app, "1 = only hide from app-uid callers, 0 = hide from every caller");
+static pid_t hide_self_zygote_pid __read_mostly;
+/* last zygote pid seen in the normal range; kept after a soft restart so
+ * getppid() keeps answering with a believable small number */
+static pid_t hide_self_last_good_zygote __read_mostly;
+static uintptr_t hide_self_init_task;
 
-static char *hide_module_name = "";
-module_param(hide_module_name, charp, 0444);
-MODULE_PARM_DESC(hide_module_name, "if set, report this name in /proc/modules instead of the real one");
+static struct delayed_work hide_self_work;
+static int hide_self_period;
+
+static struct kprobe *kp_seq_decimal;
+static struct kretprobe *kr_getppid;
+static struct kretprobe *kr_compat_getppid;
 
 /* ------------------------------------------------------------------------ */
-/* published target state                                                   */
+/* who is asking                                                            */
 /* ------------------------------------------------------------------------ */
 
 /*
- * ksud is not one process: the daemon stays up, and every "ksud ..." command
- * line is a second "ksud" that lives for milliseconds. Tracking a single pid
- * would latch onto a transient client, publish it, and then lose the daemon
- * when that client exits - the filter would flap and the daemon would be
- * visible again for a whole scan interval. So a small set is kept, published
- * as a whole.
+ * Same rule as the rest of the module: system side callers see the truth.
+ * This one runs in kprobe context, so it must stay cheap and lock free.
  */
-#define HIDE_MAX_TARGETS	8
-
-static pid_t hide_pids[HIDE_MAX_TARGETS] __read_mostly;
-static int hide_pid_count __read_mostly;
-/*
- * Seqlock: odd while hide_publish() is writing the array. Readers run in
- * kprobe context, so they cannot take a lock; they fail open on a torn or
- * in-progress read. A callback that answers "not hidden" for one syscall is
- * harmless, one that hid an unrelated pid number would not be.
- */
-static unsigned int hide_seq __read_mostly;
-
-static struct delayed_work hide_scan_work;
-static int hide_scan_period;
-
-static uintptr_t kaddr_init_task;
-
-static struct kprobe *kp_find_pid_ns;
-static struct kprobe *kp_find_task_by_pid_ns;
-static struct kprobe *kp_find_ge_pid;
-
-/* ------------------------------------------------------------------------ */
-/* match helpers - all of these run in kprobe context                       */
-/* ------------------------------------------------------------------------ */
-
-static __always_inline bool hide_pid_match(int nr)
+static __always_inline bool hide_self_reader_is_app(void)
 {
-	unsigned int seq;
-	int i;
-	bool hit = false;
-
-	if (nr <= 0)
-		return false;
-
-	seq = smp_load_acquire(&hide_seq);
-	if (seq & 1)
-		return false;	/* publish in progress: stay out of the way */
-
-	for (i = 0; i < HIDE_MAX_TARGETS && i < hide_pid_count; i++) {
-		if (hide_pids[i] == nr) {
-			hit = true;
-			break;
-		}
-	}
-
-	/* a publish we overlapped means the set we just read is not coherent */
-	if (smp_load_acquire(&hide_seq) != seq)
-		return false;
-
-	return hit;
-}
-
-/*
- * Keep root and system services seeing the truth, otherwise "ps" from adb,
- * ActivityManager's process bookkeeping and our own service.sh break.
- */
-static __always_inline bool hide_caller_filtered(void)
-{
-	if (!hide_only_from_app)
-		return true;
-
-	/* zygote installs a seccomp filter into every app process */
-	if (!is_seccomp_enabled())
-		return false;
-
 	return current_uid().val >= MIN_APP_PROCESS_UID;
 }
 
-/*
- * nr is a number in namespace @ns, so it is only comparable to hide_pids[] when
- * @ns is the initial namespace. NULL is treated as "not the initial one".
- */
-static __always_inline bool hide_ns_matches(int nr, struct pid_namespace *ns)
-{
-	if (!ns || ns->level != 0)
-		return false;
+/* ------------------------------------------------------------------------ */
+/* fake parent pid                                                          */
+/* ------------------------------------------------------------------------ */
 
-	return hide_pid_match(nr);
+/*
+ * The answer handed back to the caller. The detector only requires the parent
+ * pid to be small (< hide_self_ppid_limit), so any believable small value
+ * passes. Prefer the live zygote pid while it is itself in range; once a soft
+ * restart has renumbered zygote above the limit, keep answering with the last
+ * in-range zygote pid we saw, and only fall back to 1 (init, the task a real
+ * orphan is re-parented to) when we have never seen one.
+ */
+static __always_inline pid_t hide_self_fake_ppid(void)
+{
+	pid_t z = smp_load_acquire(&hide_self_zygote_pid);
+	pid_t last = smp_load_acquire(&hide_self_last_good_zygote);
+
+	if (z > 0 && z <= hide_self_ppid_limit)
+		return z;
+	if (last > 0 && last <= hide_self_ppid_limit)
+		return last;
+
+	return 1;
 }
 
-/* ------------------------------------------------------------------------ */
-/* target discovery                                                         */
-/* ------------------------------------------------------------------------ */
-
-static bool hide_comm_is_target(const char *comm)
+static bool hide_self_is_zygote(const char *comm)
 {
-	const char *p = hide_comm_list;
-
-	if (!p || !p[0] || !comm)
+	if (!comm)
 		return false;
 
-	while (p[0]) {
-		const char *end = strchr(p, ',');
-		int len = end ? (int)(end - p) : (int)strlen(p);
-
-		if (len > 0 && len < TASK_COMM_LEN &&
-		    !strncmp(p, comm, len) && comm[len] == '\0')
-			return true;
-
-		if (!end)
-			break;
-		p = end + 1;
-	}
-
-	return false;
+	/* zygote64, zygote, zygote32 - the app forking zygotes all share the stem */
+	return !strncmp(comm, "zygote", 6);
 }
 
 /*
- * Called from process context only (module init and the delayed work), never
- * from a kprobe handler, so it may walk the task list under RCU. No task
- * reference is taken on purpose: put_task_struct() is not something a module
- * can rely on being reachable, and every value read here (comm, pid number) is
- * stable for as long as RCU holds the task alive.
+ * Process context only (init and the timer), never kprobe context, so the
+ * task list may be walked under RCU. No task reference is taken: comm and
+ * the pid number are stable while RCU keeps the task alive.
  */
-static void hide_collect(pid_t *out, int *count)
+static void hide_self_scan(void)
 {
-	struct task_struct *init = (struct task_struct *)kaddr_init_task;
+	struct task_struct *init = (struct task_struct *)hide_self_init_task;
 	struct task_struct *p;
-	int n = 0;
+	pid_t found = 0;
 
-	*count = 0;
 	if (!init)
 		return;
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(p, &init->tasks, tasks) {
-		/* only group leaders: a "ksud" child thread must not be matched */
+		pid_t nr;
+
 		if (p->group_leader != p)
 			continue;
-		if (!hide_comm_is_target(p->comm))
+		if (!hide_self_is_zygote(p->comm))
 			continue;
-		if (n >= HIDE_MAX_TARGETS)
-			break;
 
-		out[n++] = (pid_t)task_pid_nr(p);
+		/* zygote/zygote64/zygote32 all show up; the smallest is the oldest */
+		nr = (pid_t)task_pid_nr(p);
+		if (nr > 0 && (!found || nr < found))
+			found = nr;
 	}
 	rcu_read_unlock();
 
-	*count = n;
-}
-
-static bool hide_set_equal(const pid_t *a, int an, const pid_t *b, int bn)
-{
-	int i, j;
-
-	if (an != bn)
-		return false;
-
-	for (i = 0; i < an; i++) {
-		for (j = 0; j < bn; j++)
-			if (a[i] == b[j])
-				break;
-		if (j == bn)
-			return false;
-	}
-
-	return true;
-}
-
-static void hide_publish(const pid_t *set, int count)
-{
-	unsigned int seq = smp_load_acquire(&hide_seq);
-	int i;
-
-	smp_store_release(&hide_seq, seq + 1);	/* odd: write in progress */
-	smp_mb();
-
-	for (i = 0; i < HIDE_MAX_TARGETS; i++)
-		hide_pids[i] = i < count ? set[i] : 0;
-	smp_store_release(&hide_pid_count, count);
-
-	smp_store_release(&hide_seq, seq + 2);	/* even: stable again */
-}
-
-static void hide_refresh(void)
-{
-	pid_t now[HIDE_MAX_TARGETS];
-	int count = 0;
-	int i;
-
-	hide_collect(now, &count);
-
-	if (count == hide_pid_count && hide_set_equal(now, count, hide_pids, hide_pid_count))
+	if (!found)
 		return;
 
-	if (!count) {
-		if (hide_pid_count) {
-			hide_publish(now, 0);
-			pr_info("hide_pid: no target left, filter idle\n");
+	if (found != hide_self_zygote_pid) {
+		smp_store_release(&hide_self_zygote_pid, found);
+
+		if (found <= hide_self_ppid_limit) {
+			smp_store_release(&hide_self_last_good_zygote, found);
+			pr_info("hide_self: zygote pid %d used as fake parent\n", (int)found);
+		} else {
+			pr_info("hide_self: zygote pid %d is above %d (a soft restart); getppid() keeps answering %d until zygote is back in range\n",
+				(int)found, hide_self_ppid_limit, (int)hide_self_fake_ppid());
 		}
-		return;
 	}
-
-	hide_publish(now, count);
-
-	for (i = 0; i < count; i++)
-		pr_info("hide_pid: hiding pid %d\n", (int)now[i]);
 }
 
-static void hide_scan_fn(struct work_struct *unused)
+static void hide_self_scan_fn(struct work_struct *unused)
 {
-	hide_refresh();
+	hide_self_scan();
 
-	if (hide_scan_period > 0)
-		schedule_delayed_work(&hide_scan_work,
-				      msecs_to_jiffies((unsigned int)hide_scan_period));
+	if (hide_self_period > 0)
+		schedule_delayed_work(&hide_self_work,
+				      msecs_to_jiffies((unsigned int)hide_self_period));
 }
 
 /* ------------------------------------------------------------------------ */
@@ -409,185 +229,201 @@ static void hide_scan_fn(struct work_struct *unused)
 /* ------------------------------------------------------------------------ */
 
 /*
- * struct pid *find_pid_ns(int nr, struct pid_namespace *ns)
+ * long __arm64_sys_getppid(const struct pt_regs *regs)
  *
- *   return idr_find(&ns->idr, nr);
+ *   return task_tgid_vnr(current->real_parent);
  *
- * An out-of-range nr makes the idr lookup miss, so the function returns NULL,
- * which is exactly its "no such pid" answer.
+ * On return the answer sits in x0, which is what gets rewritten here.
  */
-static int kp_find_pid_ns_pre(struct kprobe *unused, struct pt_regs *regs)
+static int hide_self_kr_getppid_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	if (!hide_caller_filtered())
+	long ret = (long)regs->regs[0];
+
+	if (ret <= (long)hide_self_ppid_limit)
 		return 0;
 
-	if (hide_ns_matches((int)PT_REGS_PARM1(regs),
-			    (struct pid_namespace *)PT_REGS_PARM2(regs)))
-		PT_REGS_PARM1(regs) = HIDE_ABSENT_PID;
+	if (!hide_self_reader_is_app())
+		return 0;
+
+	regs->regs[0] = (unsigned long)hide_self_fake_ppid();
 
 	return 0;
 }
 
 /*
- * struct task_struct *find_task_by_pid_ns(int nr, struct pid_namespace *ns)
+ * void seq_put_decimal_ull(struct seq_file *m, const char *delimiter,
+ *                          unsigned long long num)
  *
- *   return pid_task(find_pid_ns(nr, ns), PIDTYPE_PID);
+ * Three fields of interest are printed by fs/proc/array.c through this one
+ * exported helper, so a single probe covers them after an exact match:
  *
- * This is the gate /proc/<pid> uses (proc_pid_lookup -> find_task_by_pid_ns,
- * or find_vpid + get_pid_task on older trees; both are covered because
- * find_pid_ns is hooked as well).
+ *   PPid:              proc_pid_status()   the parent pid
+ *   Seccomp:           task_seccomp()      p->seccomp.mode
+ *   Seccomp_filters:   task_seccomp()      filter count
+ *
+ * The full delimiter string is the field identity and the value is the third
+ * argument (x2). Matching compares the whole string, never a prefix, because
+ * "Seccomp:" is also a prefix of "Seccomp_filters:".
  */
-static int kp_find_task_by_pid_ns_pre(struct kprobe *unused, struct pt_regs *regs)
+static const char hide_self_ppid_key[] = "\nPPid:\t";
+static const char hide_self_seccomp_key[] = "\nSeccomp:\t";
+static const char hide_self_filters_key[] = "\nSeccomp_filters:\t";
+
+static int hide_self_kp_seq_decimal_pre(struct kprobe *unused, struct pt_regs *regs)
 {
-	if (!hide_caller_filtered())
+	const char *delim;
+	unsigned long long num;
+
+	/* this function is on a hot path, so the cheapest filter comes first */
+	if (!hide_self_reader_is_app())
 		return 0;
 
-	if (hide_ns_matches((int)PT_REGS_PARM1(regs),
-			    (struct pid_namespace *)PT_REGS_PARM2(regs)))
-		PT_REGS_PARM1(regs) = HIDE_ABSENT_PID;
-
-	return 0;
-}
-
-/*
- * struct pid *find_ge_pid(int nr, struct pid_namespace *ns)
- *
- * Used by next_tgid() to produce the /proc directory listing. Bumping nr past
- * the hidden number makes the iterator skip it, so readdir("/proc") never
- * emits an entry that cannot be opened - which is what a detector would
- * notice far sooner than a missing process.
- */
-static int kp_find_ge_pid_pre(struct kprobe *unused, struct pt_regs *regs)
-{
-	int nr = (int)PT_REGS_PARM1(regs);
-
-	if (!hide_caller_filtered())
+	delim = (const char *)PT_REGS_PARM2(regs);
+	if (!delim || delim[0] != '\n')
 		return 0;
 
-	if (hide_ns_matches(nr, (struct pid_namespace *)PT_REGS_PARM2(regs)))
-		PT_REGS_PARM1(regs) = nr + 1;
+	/* P = PPid, S = Seccomp / Seccomp_filters; nothing else can match */
+	if (delim[1] != 'P' && delim[1] != 'S')
+		return 0;
 
-	return 0;
-}
-
-/* ------------------------------------------------------------------------ */
-/* optional: decoy name in /proc/modules                                    */
-/* ------------------------------------------------------------------------ */
-
-#ifdef MODULE
-/*
- * /sys/module was already unlinked by fgetpriority_init(), but /proc/modules
- * still shows the real name. Overwriting module->name hides it, at the cost
- * that "rmmod fgetpriority" stops working and the decoy name has to be used
- * instead. Empty (disabled) by default.
- */
-static void hide_module_rename(void)
-{
-	size_t len;
-
-	if (!hide_module_name || !hide_module_name[0])
-		return;
-
-	len = strlen(hide_module_name);
-	if (len >= sizeof(THIS_MODULE->name) - 1) {
-		pr_info("hide_pid: decoy name too long, ignored\n");
-		return;
+	/* both keys start with one newline, and only two second bytes exist */
+	if (!strcmp(delim, hide_self_ppid_key)) {
+		num = (unsigned long long)PT_REGS_PARM3(regs);
+		if (hide_self_debug)
+			hide_self_stat_ppid_seen++;
+		/* only an already oversized parent pid is replaced */
+		if (!hide_self_status_ppid)
+			return 0;
+		if (!num || num <= (unsigned long long)hide_self_ppid_limit)
+			return 0;
+		PT_REGS_PARM3(regs) = (unsigned long)hide_self_fake_ppid();
+		if (hide_self_debug)
+			hide_self_stat_ppid++;
+		return 0;
 	}
 
-	memset(THIS_MODULE->name, 0, sizeof(THIS_MODULE->name));
-	memcpy(THIS_MODULE->name, hide_module_name, len);
+	if (!strcmp(delim, hide_self_seccomp_key)) {
+		num = (unsigned long long)PT_REGS_PARM3(regs);
+		if (hide_self_debug)
+			hide_self_stat_seccomp_seen++;
+		if (!num)
+			return 0;
+		PT_REGS_PARM3(regs) = 2;	/* SECCOMP_MODE_FILTER */
+		if (hide_self_debug)
+			hide_self_stat_seccomp++;
+		return 0;
+	}
 
-	pr_info("hide_pid: /proc/modules now reports '%s'\n", hide_module_name);
+	if (!strcmp(delim, hide_self_filters_key)) {
+		if ((unsigned long long)PT_REGS_PARM3(regs))
+			return 0;
+		PT_REGS_PARM3(regs) = 1;	/* one filter installed */
+	}
+
+	return 0;
 }
-#endif
 
 /* ------------------------------------------------------------------------ */
 /* init / exit                                                              */
 /* ------------------------------------------------------------------------ */
 
-static __init int hide_arm(const char *sym, kprobe_pre_handler_t pre, struct kprobe **slot)
+static struct kretprobe *hide_self_arm_ret(const char *sym, kretprobe_handler_t handler)
 {
+	struct kretprobe *rp;
+
 	if (!kallsyms_lookup_name(sym)) {
-		pr_info("hide_pid: %s not in kallsyms, skipped\n", sym);
-		return -ENOENT;
+		pr_info("hide_self: %s not in kallsyms, skipped\n", sym);
+		return nullptr;
 	}
 
-	*slot = init_kprobe(sym, pre);
-	if (!*slot)
-		return -EAGAIN;
+	rp = kzalloc(sizeof(struct kretprobe), GFP_KERNEL | __GFP_NOFAIL);
+	rp->kp.symbol_name = sym;
+	rp->handler = handler;
+	rp->maxactive = 64;
 
-	return 0;
+	if (register_kretprobe(rp)) {
+		pr_info("hide_self: register %s kretprobe failed\n", sym);
+		kfree(rp);
+		return nullptr;
+	}
+
+	return rp;
 }
 
-static __init int hide_pid_init(void)
+static void hide_self_disarm_ret(struct kretprobe **rp_ptr)
+{
+	struct kretprobe *rp = *rp_ptr;
+
+	if (!rp)
+		return;
+
+	unregister_kretprobe(rp);
+	synchronize_rcu();
+	kfree(rp);
+	*rp_ptr = nullptr;
+}
+
+static __init int hide_self_init(void)
 {
 	int armed = 0;
-	int i;
 
-	kaddr_init_task = kallsyms_lookup_name("init_task");
-	if (!kaddr_init_task) {
-		pr_info("hide_pid: init_task not in kallsyms, cannot track the target\n");
+	hide_self_init_task = kallsyms_lookup_name("init_task");
+	if (!hide_self_init_task) {
+		pr_info("hide_self: init_task not in kallsyms, cannot look up zygote\n");
 		return -ENOENT;
 	}
 
-	if (hide_scan_ms > 0 && hide_scan_ms < HIDE_SCAN_MIN_MS) {
-		pr_info("hide_pid: hide_scan_ms=%d too small, clamped to %d\n",
-			hide_scan_ms, HIDE_SCAN_MIN_MS);
-		hide_scan_ms = HIDE_SCAN_MIN_MS;
+	if (hide_self_scan_ms > 0 && hide_self_scan_ms < HIDE_SELF_SCAN_MIN_MS) {
+		pr_info("hide_self: hide_self_scan_ms=%d too small, clamped to %d\n",
+			hide_self_scan_ms, HIDE_SELF_SCAN_MIN_MS);
+		hide_self_scan_ms = HIDE_SELF_SCAN_MIN_MS;
 	}
 
-	if (!hide_arm("find_pid_ns", (kprobe_pre_handler_t)kp_find_pid_ns_pre,
-		      &kp_find_pid_ns))
+	hide_self_scan();
+
+	kr_getppid = hide_self_arm_ret("__arm64_sys_getppid",
+				       hide_self_kr_getppid_ret);
+	if (kr_getppid)
 		armed++;
 
-	if (!hide_arm("find_task_by_pid_ns",
-		      (kprobe_pre_handler_t)kp_find_task_by_pid_ns_pre,
-		      &kp_find_task_by_pid_ns))
+	/* only present with CONFIG_COMPAT, a missing symbol is expected there */
+	kr_compat_getppid = hide_self_arm_ret("__arm64_compat_sys_getppid",
+					      hide_self_kr_getppid_ret);
+	if (kr_compat_getppid)
 		armed++;
 
-	if (!hide_arm("find_ge_pid", (kprobe_pre_handler_t)kp_find_ge_pid_pre,
-		      &kp_find_ge_pid))
-		armed++;
-
-#ifdef MODULE
-	hide_module_rename();
-#endif
-
-	/*
-	 * Publish before returning: does not matter whether the hooks or the set
-	 * land first, an empty set simply hides nothing for that instant.
-	 */
-	hide_refresh();
-	if (!hide_pid_count)
-		pr_info("hide_pid: no '%s' process yet, will keep scanning\n",
-			hide_comm_list);
-
-	if (hide_scan_ms > 0) {
-		hide_scan_period = hide_scan_ms;
-		INIT_DELAYED_WORK(&hide_scan_work, hide_scan_fn);
-		schedule_delayed_work(&hide_scan_work,
-				      msecs_to_jiffies((unsigned int)hide_scan_period));
-		pr_info("hide_pid: rescan every %dms\n", hide_scan_period);
+	if (hide_self_seccomp || hide_self_status_ppid) {
+		kp_seq_decimal = init_kprobe("seq_put_decimal_ull",
+					     (kprobe_pre_handler_t)hide_self_kp_seq_decimal_pre);
+		if (kp_seq_decimal)
+			armed++;
 	}
 
-	pr_info("hide_pid: %d hook(s) armed, %d pid(s) hidden\n",
-		armed, hide_pid_count);
-	for (i = 0; i < hide_pid_count; i++)
-		pr_info("hide_pid:   pid %d\n", (int)hide_pids[i]);
+	if (hide_self_scan_ms > 0) {
+		hide_self_period = hide_self_scan_ms;
+		INIT_DELAYED_WORK(&hide_self_work, hide_self_scan_fn);
+		schedule_delayed_work(&hide_self_work,
+				      msecs_to_jiffies((unsigned int)hide_self_period));
+	}
+
+	pr_info("hide_self: %d hook(s) armed, fake parent pid %d, ppid limit %d, status ppid %d\n",
+		armed, (int)hide_self_fake_ppid(), hide_self_ppid_limit,
+		hide_self_status_ppid);
 
 	return armed ? 0 : -ENODEV;
 }
 
-static void hide_pid_exit(void)
+static void hide_self_exit(void)
 {
-	if (hide_scan_period > 0) {
-		hide_scan_period = 0;
-		cancel_delayed_work_sync(&hide_scan_work);
+	if (hide_self_period > 0) {
+		hide_self_period = 0;
+		cancel_delayed_work_sync(&hide_self_work);
 	}
 
-	destroy_kprobe(&kp_find_pid_ns);
-	destroy_kprobe(&kp_find_task_by_pid_ns);
-	destroy_kprobe(&kp_find_ge_pid);
+	hide_self_disarm_ret(&kr_getppid);
+	hide_self_disarm_ret(&kr_compat_getppid);
+	destroy_kprobe(&kp_seq_decimal);
 
-	hide_publish(hide_pids, 0);
+	smp_store_release(&hide_self_zygote_pid, 0);
+	smp_store_release(&hide_self_last_good_zygote, 0);
 }
