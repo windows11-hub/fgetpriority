@@ -306,8 +306,10 @@ static int __init fgetpriority_init(void)
 	/*
 	 * Three independent features are armed here:
 	 *   1. the priority/ioprio uid filter (routine_raw.c, kprobes fallback)
-	 *   2. the pid filter (hide_pid.c, kprobes only)
-	 *   3. the self check spoof (hide_self.c, kprobe + kretprobes)
+	 *   2. the pid filter (hide_pid.c, kprobes only): hides the ksud daemon
+	 *      and, after a soft restart, the abnormally-numbered zygote
+	 *   3. the self check spoof (hide_self.c, kprobe + kretprobes): spoofs
+	 *      getppid() (which reports the zygote's pid) and Seccomp for apps
 	 * Any one alone is useful, so a failure in one must not stop the
 	 * others. Only "all failed" makes the module pointless.
 	 */
