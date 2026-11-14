@@ -125,7 +125,7 @@
  * 7. KNOWN GAPS (by design, not bugs)
  *
  *  - Table-wide walks that never name a pid are untouched: kill(-1, 0) still
- *    returns 0. getpriority(PRIO_USER, uid), the channel the 春秋 detector uses
+ *    returns 0. getpriority(PRIO_USER, uid), the channel the 鏄ョ detector uses
  *    for its "hidden app list" check, is already handled by routine_raw.c.
  *  - Thread ids are not filtered; the match key is the group leader pid, which
  *    is what task_pid_nr()/ps show.
@@ -143,7 +143,7 @@
  * and each matching hit costs a trap into the kprobe handler. The handler
  * itself is three comparisons, but the trap is real. If the regression
  * matters more than the coverage, keep only find_task_by_pid_ns (covers
- * /proc and the sched_*/priority families) and drop the other two.
+ * /proc and the sched_* and priority families) and drop the other two.
  */
 
 #include <asm/barrier.h>
