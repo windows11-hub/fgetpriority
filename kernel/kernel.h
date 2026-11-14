@@ -38,6 +38,7 @@
 #include <linux/module.h>
 #include <linux/ptrace.h>
 #include <linux/resource.h>
+#include <linux/seq_file.h>
 #include <linux/string.h>
 #include <linux/thread_info.h>
 #include <linux/stop_machine.h>
