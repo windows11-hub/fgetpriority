@@ -115,11 +115,16 @@ static pid_t hide_self_zygote_pid __read_mostly;
  * getppid() keeps answering with a believable small number */
 static pid_t hide_self_last_good_zygote __read_mostly;
 /*
- * Per-boot random salt for the synthetic parent pid. Drawn once in init so the
- * mapping pid -> fake ppid cannot be predicted from outside, while staying
- * identical for the lifetime of the boot.
+ * Random salt for the synthetic parent pid.
+ *
+ * Redrawn every time the tracked zygote pid changes (a soft restart gives
+ * zygote a new number), so the synthetic parents of a new generation are not
+ * correlated with the previous one. Within one generation the salt is fixed,
+ * which is what keeps a given process's answer stable across calls.
  */
 static u32 hide_self_ppid_salt __read_mostly;
+/* guard so the redraw below cannot spin forever on a broken RNG */
+#define HIDE_SELF_RAND_MAX_TRIES	64
 static uintptr_t hide_self_init_task;
 
 static struct delayed_work hide_self_work;
@@ -195,8 +200,82 @@ static __always_inline pid_t hide_self_fake_ppid_for(pid_t self_pid)
 	h *= 3266489917u;
 	h ^= h >> 16;
 
-	/* 1 + [0, span-1] keeps the result inside [1, limit-1] */
-	return (pid_t)(1u + (h % span));
+	/* 1 + [0, span-1] keeps the result inside [1, limit-1]. The modulo already
+	 * guarantees the bound, so the retry the requirement asks for never has to
+	 * fire here - but the value is re-mixed if it ever does, instead of being
+	 * returned out of range. */
+	{
+		u32 v = 1u + (h % span);
+		int tries = 0;
+
+		while (v >= (u32)hide_self_ppid_limit &&
+		       tries < HIDE_SELF_RAND_MAX_TRIES) {
+			h ^= h >> 11;
+			h *= 2654435761u;
+			h ^= h >> 15;
+			v = 1u + (h % span);
+			tries++;
+		}
+
+		return (pid_t)(v < (u32)hide_self_ppid_limit ? v : 1u);
+	}
+}
+
+/*
+ * Draw the generator value for the synthetic parent pid, retrying until it is
+ * below the configured limit.
+ *
+ * The requirement is "a random number, and if it is not under 5000 draw
+ * again". get_random_u32() spans the full 32-bit range, so the retry loop is
+ * not a formality: the probability of a single draw landing under 5000 is
+ * about 1.2e-6, and a bare loop would spin ~860000 times on average - inside
+ * module load and inside a workqueue callback. Trying 64 times and falling
+ * back would therefore essentially always fall back.
+ *
+ * So the draw is scaled instead: sample modulo the usable span, which is
+ * uniform over [0, span) and therefore always in range on the first try. The
+ * retry loop is kept as a belt-and-braces check (span == 0, a future change in
+ * the range arithmetic) rather than as the primary mechanism.
+ */
+static u32 hide_self_draw_salt(void)
+{
+	u32 span;
+	u32 v;
+	int tries = 0;
+
+	if (hide_self_ppid_limit <= 1)
+		return 0;
+
+	/* the synthetic pid must land in [1, limit-1] */
+	span = (u32)(hide_self_ppid_limit - 1);
+
+	/*
+	 * "Draw a random number and redraw until it is under 5000" is the stated
+	 * rule, and it is kept below - but reached in a way that can actually
+	 * finish.
+	 *
+	 * A raw 32-bit draw is under 5000 with probability 5000/2^32, about
+	 * 1.16e-6: the expected number of draws is ~860000, and this runs inside
+	 * module load and inside a workqueue callback, so a literal loop would
+	 * stall the queue for a variable and occasionally very long time.
+	 *
+	 * Reducing the draw into [0, span) first is the same distribution the
+	 * rejection loop converges to (uniform over the accepted range), just
+	 * without the wasted spins. The rejection check stays as the correctness
+	 * guard for the range arithmetic.
+	 */
+	do {
+		v = 1u + (get_random_u32() % span);
+		tries++;
+	} while (v >= (u32)hide_self_ppid_limit &&
+		 tries < HIDE_SELF_RAND_MAX_TRIES);
+
+	/* cannot happen while span < limit, kept so a future range change cannot
+	 * leak an out-of-range salt into the mapping */
+	if (v >= (u32)hide_self_ppid_limit)
+		v = 1;
+
+	return v;
 }
 
 static bool hide_self_is_zygote(const char *comm)
@@ -242,15 +321,24 @@ static void hide_self_scan(void)
 		return;
 
 	if (found != hide_self_zygote_pid) {
+		/*
+		 * The tracked zygote changed, so this is a new generation: record the
+		 * pid and redraw the salt, so the synthetic parents handed out after a
+		 * soft restart are unrelated to the ones handed out before it.
+		 *
+		 * Order matters. The salt is published first, then the pid, so a
+		 * concurrent getppid() either sees the old salt with the old pid or
+		 * the new salt with the new pid - never the previous generation's salt
+		 * applied to the next generation's pid.
+		 */
+		smp_store_release(&hide_self_ppid_salt, hide_self_draw_salt());
 		smp_store_release(&hide_self_zygote_pid, found);
 
-		if (found <= hide_self_ppid_limit) {
+		if (found <= hide_self_ppid_limit)
 			smp_store_release(&hide_self_last_good_zygote, found);
-			pr_info("hide_self: zygote pid %d used as fake parent\n", (int)found);
-		} else {
-			pr_info("hide_self: zygote pid %d is above %d (a soft restart); getppid() will report a synthetic parent below %d\n",
-				(int)found, hide_self_ppid_limit, hide_self_ppid_limit);
-		}
+
+		pr_info("hide_self: zygote pid %d recorded, salt redrawn; getppid() reports a synthetic parent in [1,%d]\n",
+			(int)found, hide_self_ppid_limit - 1);
 	}
 }
 
@@ -442,11 +530,12 @@ static __init int hide_self_init(void)
 	}
 
 	/*
-	 * Drawn once per load so the pid -> fake-ppid mapping is not a fixed
-	 * function an observer could reproduce, while staying constant for the
-	 * boot so a given process always gets the same answer.
+	 * Seed the salt before the first scan, so the mapping is not a fixed
+	 * function an observer could reproduce. hide_self_scan() redraws it again
+	 * whenever it discovers the zygote id, which is the authoritative path;
+	 * this one only covers the window before that happens.
 	 */
-	smp_store_release(&hide_self_ppid_salt, get_random_u32());
+	smp_store_release(&hide_self_ppid_salt, hide_self_draw_salt());
 
 	hide_self_scan();
 
