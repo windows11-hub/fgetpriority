@@ -316,11 +316,19 @@ static int __init fgetpriority_init(void)
 	 * Three independent features are armed here:
 	 *   1. the priority/ioprio uid filter (routine_raw.c, kprobes fallback)
 	 *   2. the pid filter (hide_pid.c, kprobes only): hides the ksud daemon
-	 *      and, after a soft restart, the abnormally-numbered zygote
-	 *   3. the self check spoof (hide_self.c, kprobe + kretprobes): spoofs
-	 *      getppid() (which reports the zygote's pid) and Seccomp for apps
+	 *   3. the temporary-root fix (hide_self.c): wraps the pid counter so a
+	 *      restarted zygote takes a REAL small pid, plus a Seccomp rewrite
+	 *
 	 * Any one alone is useful, so a failure in one must not stop the
 	 * others. Only "all failed" makes the module pointless.
+	 *
+	 * ORDER MATTERS for (3) and it is not cosmetic. hide_self_init() lowers
+	 * init_pid_ns.pid_max, and while that ceiling is down the allocatable
+	 * range is only [RESERVED_PIDS, pid_max) - the low hundreds are already
+	 * taken by init, kthreadd and the kworkers at boot. So the dangerous
+	 * window has to be as short as possible and must not be widened by
+	 * another subsystem's setup running inside it. Hence: arm (3) LAST, and
+	 * tear it down FIRST.
 	 */
 	/*
 	 * Branch patching (routine_raw.c) is OFF by default, and this is not a
@@ -360,11 +368,24 @@ static int __init fgetpriority_init(void)
 	int pid_ret = hide_pid_init();
 	pr_info("init: hide_pid ret: %d\n", pid_ret);
 
+	/*
+	 * Last, so the lowered pid_max window covers as little of init as
+	 * possible. If this ran earlier, hide_pid_init()'s initial task walk and
+	 * its first snapshot allocation would all happen inside the window where
+	 * the allocator range is only a few thousand pids wide.
+	 */
 	int self_ret = hide_self_init();
 	pr_info("init: hide_self ret: %d\n", self_ret);
 
 	if (prio_ret && pid_ret && self_ret) {
 		pr_info("init: nothing armed, aborting\n");
+		/*
+		 * hide_self_init() may already have lowered init_pid_ns.pid_max even
+		 * though the module is about to fail out. Bailing without undoing it
+		 * would leave the system running with a fork()-starving pid range for
+		 * as long as the machine stays up, so give it back on every exit path.
+		 */
+		hide_self_exit();
 		return prio_ret;
 	}
 
@@ -406,6 +427,12 @@ static void __exit fgetpriority_exit(void)
 	if (ret)
 		panic("kobj add failed!\n");
 
+	/*
+	 * Teardown mirrors setup: (3) comes down first so init_pid_ns.pid_max is
+	 * restored before anything else runs. Leaving the reduced ceiling in
+	 * place while the remaining teardown executes keeps the fork()-starving
+	 * state alive for no reason.
+	 */
 	hide_self_exit();
 	hide_pid_exit();
 
