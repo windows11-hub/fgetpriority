@@ -12,13 +12,15 @@
  * turns a pid number into a task, from /proc/<pid>, and from the /proc
  * directory listing itself.
  *
- * Two channels are hidden:
- *   1. processes whose comm matches hide_comm_list (default "ksud", the
- *      temporary root daemon);
- *   2. a zygote whose pid went abnormally high after a soft restart
- *      (temporary root / 免解). The getppid() side of that signal is spoofed
- *      in hide_self.c; here the huge pid itself is hidden from /proc and
- *      every pid -> task lookup an app can reach.
+ * Only processes whose comm matches hide_comm_list (default "ksud", the
+ * temporary root daemon) are hidden.
+ *
+ * Deliberately NOT hidden: zygote. An earlier revision also matched a zygote
+ * whose pid was above 5000 after a soft restart, and that bricked every app
+ * because the pid filter denies /proc/<pid>, kill/waitid and all pid -> task
+ * lookups - zygote is the root of the Android process tree and must stay
+ * resolvable. The soft-restart / temporary-root signal is addressed in
+ * hide_self.c by spoofing getppid() and the PPid/Seccomp fields instead.
  *
  * Unity built: main.c includes this file after arch.h, routine.h and
  * routine_kp.c, so PT_REGS_*, init_kprobe()/destroy_kprobe(), the
@@ -133,7 +135,7 @@
  * 7. KNOWN GAPS (by design, not bugs)
  *
  *  - Table-wide walks that never name a pid are untouched: kill(-1, 0) still
- *    returns 0. getpriority(PRIO_USER, uid), the channel the 春秋 detector uses
+ *    returns 0. getpriority(PRIO_USER, uid), the channel the 鏄ョ detector uses
  *    for its "hidden app list" check, is already handled by routine_raw.c.
  *  - Thread ids are not filtered; the match key is the group leader pid, which
  *    is what task_pid_nr()/ps show.
@@ -176,9 +178,27 @@
  */
 #define HIDE_SCAN_MIN_MS	250
 
-static char *hide_comm_list = "ksud";
+/*
+ * Hard ceiling on the tracked set. The snapshot is sized to the match count,
+ * and a match count is only bounded by the number of processes on the device.
+ * A runaway match (a broad comm, a fork storm) would ask kzalloc for an
+ * arbitrarily large block on every rescan. Clamping keeps the cost predictable
+ * and still covers every realistic case; a truncated set only means the extra
+ * pids stay visible for one more scan.
+ */
+#define HIDE_MAX_TARGETS	256
+
+/*
+ * Fail safe, not fail open onto the device's throat.
+ *
+ * An empty list hides nothing, so a plain insmod arms the hooks but changes
+ * no behaviour. Hiding something is always an explicit act, which means a
+ * typo or a default can never be the thing that breaks a boot. service.sh
+ * passes hide_comm_list=ksud explicitly.
+ */
+static char *hide_comm_list = "";
 module_param(hide_comm_list, charp, 0444);
-MODULE_PARM_DESC(hide_comm_list, "comma separated comm names to hide (default: ksud)");
+MODULE_PARM_DESC(hide_comm_list, "comma separated comm names to hide (empty = hide nothing)");
 
 static int hide_scan_ms = 1000;
 module_param(hide_scan_ms, int, 0444);
@@ -192,13 +212,6 @@ static char *hide_module_name = "";
 module_param(hide_module_name, charp, 0444);
 MODULE_PARM_DESC(hide_module_name, "if set, report this name in /proc/modules instead of the real one");
 
-static int hide_zygote_abnormal = 1;
-module_param(hide_zygote_abnormal, int, 0444);
-MODULE_PARM_DESC(hide_zygote_abnormal, "1 = hide a zygote whose pid is above hide_zygote_pid_limit (temporary root), 0 = leave it");
-
-static int hide_zygote_pid_limit = 5000;
-module_param(hide_zygote_pid_limit, int, 0444);
-MODULE_PARM_DESC(hide_zygote_pid_limit, "pid threshold above which a zygote is treated as soft-restarted (default: 5000)");
 
 /* ------------------------------------------------------------------------ */
 /* published target state                                                   */
@@ -213,8 +226,8 @@ MODULE_PARM_DESC(hide_zygote_pid_limit, "pid threshold above which a zygote is t
  *
  * The hidden set is published as one immutable snapshot behind an RCU pointer,
  * sized to exactly the number of targets found on the last scan, so there is
- * no fixed cap: a soft restart that leaves zygote plus several same-comm
- * children behind all get hidden. Readers run in kprobe context where they
+ * no fixed cap: a soft restart that leaves several same-comm "ksud"
+ * processes behind all get hidden. Readers run in kprobe context where they
  * cannot sleep or take a lock, so they only rcu_read_lock() and
  * rcu_dereference() the pointer - which is precisely what RCU is for. A writer
  * allocates a fresh snapshot, swaps the pointer, and frees the old one through
@@ -301,13 +314,35 @@ static __always_inline bool hide_ns_matches(int nr, struct pid_namespace *ns)
 /* target discovery                                                         */
 /* ------------------------------------------------------------------------ */
 
-static bool hide_is_zygote_comm(const char *comm)
+/*
+ * Processes the framework cannot lose sight of. Hiding any of these denies
+ * /proc/<pid>, kill/waitid and every pid -> task lookup for it, which breaks
+ * process management device-wide - hiding zygote or system_server means no
+ * app can start at all. This list is a safety interlock: it applies even when
+ * hide_comm_list is configured badly, so a typo cannot brick the device.
+ */
+static bool hide_is_critical_comm(const char *comm)
 {
-	if (!comm)
-		return false;
+	static const char *const critical[] = {
+		"init", "zygote", "zygote64", "zygote32",
+		"usap32", "usap64", "system_server", "surfaceflinger",
+	};
+	int i;
 
-	/* zygote64 / zygote / zygote32, and usap32 / usap64 on some devices */
-	return !strncmp(comm, "zygote", 6) || !strncmp(comm, "usap", 4);
+	if (!comm)
+		return true;	/* unknown: refuse rather than risk it */
+
+	for (i = 0; i < (int)ARRAY_SIZE(critical); i++) {
+		if (!strcmp(comm, critical[i]))
+			return true;
+	}
+
+	/* prefix check on the stem so a future rename (zygote64_x, usap32x)
+	 * cannot slip past the exact list above */
+	if (!strncmp(comm, "zygote", 6) || !strncmp(comm, "usap", 4))
+		return true;
+
+	return false;
 }
 
 static bool hide_comm_is_target(const char *comm)
@@ -315,6 +350,10 @@ static bool hide_comm_is_target(const char *comm)
 	const char *p = hide_comm_list;
 
 	if (!p || !p[0] || !comm)
+		return false;
+
+	/* interlock: never match a process the system depends on */
+	if (hide_is_critical_comm(comm))
 		return false;
 
 	while (p[0]) {
@@ -333,17 +372,36 @@ static bool hide_comm_is_target(const char *comm)
 	return false;
 }
 
+/*
+ * NEVER hide a process the rest of the system depends on.
+ *
+ * The pid filter answers "no such process" to every caller that passes
+ * hide_caller_filtered(), which includes /proc/<pid>, kill/waitid, stat and
+ * every pid -> task lookup. That is fine for a root daemon nothing else
+ * tracks, but zygote is the root of the whole Android process tree: apps are
+ * forked from it and system_server has to keep resolving and waiting on
+ * those pids. Hiding zygote breaks process management and no app can start.
+ *
+ * An earlier revision also matched a "zygote above hide_zygote_pid_limit"
+ * (the soft-restart / temporary-root case) and that is exactly what made
+ * every app unlaunchable. The zygote side of the temporary-root signal is
+ * handled in hide_self.c by spoofing getppid() and /proc/self/status; the
+ * process itself must stay fully visible.
+ */
 static bool hide_task_is_target(struct task_struct *p, pid_t nr)
 {
-	/* channel 1: comm matches hide_comm_list (default "ksud") */
-	if (hide_comm_is_target(p->comm))
-		return true;
+	/*
+	 * Only user processes with an address space. A kernel thread has no mm and
+	 * hiding one (kworker, kthreadd, anything a broad comm match could catch)
+	 * makes workqueue / scheduler bookkeeping lose the task, which panics the
+	 * device rather than merely breaking an app. This is a structural check,
+	 * not a name list, so it cannot be defeated by an unexpected comm.
+	 */
+	if (!p->mm)
+		return false;
 
-	/* channel 2: a zygote renumbered by a soft restart (temporary root).
-	 * Its getppid() view is spoofed in hide_self.c; here the abnormal pid
-	 * is hidden from /proc and pid -> task lookups. */
-	if (hide_zygote_abnormal && hide_is_zygote_comm(p->comm) &&
-	    nr > hide_zygote_pid_limit)
+	/* only processes whose comm matches hide_comm_list (default "ksud") */
+	if (hide_comm_is_target(p->comm))
 		return true;
 
 	return false;
@@ -370,13 +428,16 @@ static struct hide_snapshot *hide_collect(void)
 	if (!init)
 		return NULL;
 
-	/* pass 1: count matching group leaders */
+	/* pass 1: count matching group leaders, bounded by the hard ceiling */
 	rcu_read_lock();
 	list_for_each_entry_rcu(p, &init->tasks, tasks) {
 		if (p->group_leader != p)
 			continue;
-		if (hide_task_is_target(p, (pid_t)task_pid_nr(p)))
-			total++;
+		if (!hide_task_is_target(p, (pid_t)task_pid_nr(p)))
+			continue;
+		total++;
+		if (total >= HIDE_MAX_TARGETS)
+			break;
 	}
 	rcu_read_unlock();
 
@@ -682,10 +743,19 @@ static void hide_pid_exit(void)
 	destroy_kprobe(&kp_find_task_by_pid_ns);
 	destroy_kprobe(&kp_find_ge_pid);
 
-	/* synchronize_rcu() here also drains every call_rcu() callback hide_publish
-	 * queued, so no snapshot is freed from module text after unload. */
+	/*
+	 * The final snapshot is freed here, but hide_publish() may still have
+	 * call_rcu(&old->rcu, hide_snapshot_free_rcu) pending, and that callback
+	 * lives in module text. Unloading the module with a callback still queued
+	 * is a use-after-free of freed kernel text on the next grace period:
+	 * an immediate panic, not a graceful failure.
+	 *
+	 * synchronize_rcu() only waits for readers, it does NOT run callbacks.
+	 * rcu_barrier() is the primitive that also drains the queued callbacks,
+	 * so nothing can execute this module's code after return.
+	 */
 	s = rcu_dereference_protected(hide_snap, 1);
 	rcu_assign_pointer(hide_snap, NULL);
-	synchronize_rcu();
+	rcu_barrier();
 	kfree(s);
 }
