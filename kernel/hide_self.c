@@ -162,8 +162,16 @@ MODULE_PARM_DESC(wrap_restore_ms, "ms after which pid_max is restored automatica
 
 /* the pid below which a zygote is considered healthy */
 static int hide_self_ppid_limit = 5000;
-module_param(hide_self_ppid_limit, int, 0444);
+module_param(hide_self_ppid_limit, int, 0644);
 MODULE_PARM_DESC(hide_self_ppid_limit, "a zygote pid below this is what the detector wants (default 5000)");
+
+/*
+ * Width of the bitmap used to reserve a free synthetic pid. It must be at
+ * least hide_self_ppid_limit (so every candidate below the limit fits), plus
+ * headroom in case the limit is raised. 8192 covers the default 5000 with
+ * room to spare while keeping the bitmap at 1 KiB on the kretprobe stack.
+ */
+#define HIDE_SELF_FAKE_BITMAP_BITS	8192
 
 /*
  * 1 = answer apps with a synthetic parent pid when the real one is too large.
@@ -193,10 +201,12 @@ static int hide_self_seccomp = 0;
 module_param(hide_self_seccomp, int, 0644);
 MODULE_PARM_DESC(hide_self_seccomp, "1 = rewrite Seccomp:0 to 2 for apps (default 0, hot path)");
 
-/* diagnostics; off by default because the status hook runs on a hot path */
+/* diagnostics. Off by default: the getppid hook is hot, and this logs every
+ * app call, so it is for tracing the soft-reboot failure, not for daily use.
+ * Writable so service.sh can flip it on without recompiling. */
 static int hide_self_debug;
-module_param(hide_self_debug, int, 0444);
-MODULE_PARM_DESC(hide_self_debug, "1 = log hook activity from the rescan timer");
+module_param(hide_self_debug, int, 0644);
+MODULE_PARM_DESC(hide_self_debug, "1 = trace getppid masking decisions (hot path, off by default)");
 
 /* ------------------------------------------------------------------------ */
 /* state                                                                    */
@@ -318,15 +328,27 @@ static int hide_self_kr_getppid_ret(struct kretprobe_instance *ri, struct pt_reg
 	pid_t want;
 
 	/* a small answer is already what a healthy zygote looks like */
-	if (ret <= 0 || ret < (long)hide_self_ppid_limit)
+	if (ret <= 0 || ret < (long)hide_self_ppid_limit) {
+		if (hide_self_debug && ret > 0 && ret < (long)hide_self_ppid_limit)
+			pr_info("hide_self: getppid %d already below limit\n", (int)ret);
 		return 0;
+	}
 
 	/* only apps are disguised; root/shell/system keep the truth so ps,
 	 * ActivityManager and our own scripts still work */
-	if (!hide_self_reader_is_app())
+	if (!hide_self_reader_is_app()) {
+		if (hide_self_debug)
+			pr_info("hide_self: getppid %d from non-app uid %u, skipped\n",
+				(int)ret, current_uid().val);
 		return 0;
+	}
 
 	want = (pid_t)ret;
+
+	if (hide_self_debug)
+		pr_info("hide_self: app getppid %d, fake_for=%d fake_pid=%d\n",
+			(int)want, (int)smp_load_acquire(&hide_self_fake_for),
+			(int)smp_load_acquire(&hide_self_fake_pid));
 
 	/*
 	 * Read-only fast path. Answer with the existing disguise if it covers
@@ -405,21 +427,29 @@ static pid_t hide_self_pick_fake_pid(pid_t avoid)
 	 * whole list for every collision, and on a busy device the low range is
 	 * mostly occupied - that is hundreds of full traversals in the worst case.
 	 */
+	/*
+	 * The bitmap must be able to represent every pid below the limit, or a
+	 * limit above the bitmap width would make this function bail out and the
+	 * disguise silently never happen. The limit is a module parameter (default
+	 * 5000), so size the bitmap generously above it and refuse only when the
+	 * configured limit exceeds even that slack.
+	 */
 	{
-		DECLARE_BITMAP(used, 4096);
+		DECLARE_BITMAP(used, HIDE_SELF_FAKE_BITMAP_BITS);
 		struct task_struct *p;
 		unsigned int span;
 
-		if (hide_self_ppid_limit > 4096)
+		if (hide_self_ppid_limit <= 2 ||
+		    hide_self_ppid_limit > HIDE_SELF_FAKE_BITMAP_BITS)
 			return 0;
 
-		bitmap_zero(used, 4096);
+		bitmap_zero(used, HIDE_SELF_FAKE_BITMAP_BITS);
 
 		rcu_read_lock();
 		list_for_each_entry_rcu(p, &init->tasks, tasks) {
 			int nr = task_pid_nr(p);
 
-			if (nr > 0 && nr < 4096)
+			if (nr > 0 && nr < HIDE_SELF_FAKE_BITMAP_BITS)
 				__set_bit(nr, used);
 		}
 		rcu_read_unlock();
@@ -427,7 +457,7 @@ static pid_t hide_self_pick_fake_pid(pid_t avoid)
 		/* keep pid 0/1 out and never collide with the pid being disguised */
 		__set_bit(0, used);
 		__set_bit(1, used);
-		if (avoid > 0 && avoid < 4096)
+		if (avoid > 0 && avoid < HIDE_SELF_FAKE_BITMAP_BITS)
 			__set_bit(avoid, used);
 
 		span = (unsigned int)(hide_self_ppid_limit - 1);
