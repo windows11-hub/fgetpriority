@@ -7,7 +7,9 @@ KO="$MODDIR/ko/fgetpriority.ko"
 # comma separated comm names to hide
 HIDE_COMM=${HIDE_COMM:-ksud}
 # rescan interval in ms, used to pick up a new pid after a soft reboot
-HIDE_SCAN_MS=${HIDE_SCAN_MS:-1000}
+# ksud 是开机后固定存在的守护进程，pid 不会每秒变化。1 秒一次的
+# 全表扫描（每次还 kzalloc 快照）是打开应用变慢的主因之一，降到 30 秒。
+HIDE_SCAN_MS=${HIDE_SCAN_MS:-30000}
 # 1 = only hide from app-uid callers (ps from adb keeps working)
 HIDE_APP_ONLY=${HIDE_APP_ONLY:-1}
 # optional decoy name for /proc/modules, empty = leave the real name
@@ -34,10 +36,6 @@ done
 WRAP_PID_MAX=${WRAP_PID_MAX:-4096}
 # How long the lowered ceiling is kept before the module restores it.
 WRAP_RESTORE_MS=${WRAP_RESTORE_MS:-5000}
-# 1 = this script restarts zygote so the new small pid takes effect. This
-# kills every running app and takes the device through a soft boot; set 0 if
-# you prefer to do it yourself.
-WRAP_RESTART_ZYGOTE=${WRAP_RESTART_ZYGOTE:-1}
 
 PARAMS="hide_comm_list=$HIDE_COMM hide_scan_ms=$HIDE_SCAN_MS hide_only_from_app=$HIDE_APP_ONLY"
 PARAMS="$PARAMS wrap_pid_max=$WRAP_PID_MAX wrap_restore_ms=$WRAP_RESTORE_MS"
@@ -77,22 +75,17 @@ fi
 # concluded nothing needed doing. And a shell cannot tell which zygote is the
 # app parent at all; the kernel can, by counting usap children.
 #
-# So: read the verdict from the module's own log.
+# So: confirm the disguise armed by reading the module's own log.
 #
-# The module answers one question - "does any app process report a parent
-# above the limit?" - and prints a line naming the worst parent when the
-# answer is yes. It needs no polling for a zygote name and no app children to
-# exist: an app process that is running at all is enough to answer it.
-_verdict=$(dmesg | sed -n 's/.*hide_self: \([0-9]\+\) app process(es) have a parent above.*/RESTART/p; s/.*hide_self: every app parent is below.*/CLEAN/p' | tail -n1)
-_worst=$(dmesg | sed -n 's/.*have a parent above [0-9]\+ (worst: parent \([0-9]\+\) of pid [0-9]\+).*/\1/p' | tail -n1)
+# The getppid() kretprobe discovers the oversized parent on its own and queues
+# a mint; no scan, no restart, no zygote pid needed. The only thing worth
+# echoing back here is whether a disguise has actually been published yet.
+_mask=$(dmesg | sed -n 's/.*hide_self: masking parent pid [0-9]\+ as \([0-9]\+\).*/\1/p' | tail -n1)
 
-if [ "$WRAP_RESTART_ZYGOTE" != "1" ]; then
-	echo "fgetpriority: restart disabled, run 'setprop ctl.restart zygote' yourself" >&2
-elif [ "$_verdict" != "RESTART" ]; then
-	echo "fgetpriority: no oversized app parent seen (${_verdict:-no scan yet}), nothing to restart" >&2
+if [ -n "$_mask" ]; then
+	echo "fgetpriority: getppid disguise armed, fake parent pid $_mask" >&2
 else
-	echo "fgetpriority: an app parent is at pid ${_worst:-unknown}, above 5000 - restarting zygote" >&2
-	setprop ctl.restart zygote 2>/dev/null || true
+	echo "fgetpriority: no disguise yet - it appears on the first oversized getppid() from an app" >&2
 fi
 
 # ---- verify ---------------------------------------------------------------
