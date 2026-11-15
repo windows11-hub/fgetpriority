@@ -30,6 +30,7 @@
 #include <asm/memory.h>
 #include <asm/syscall.h>
 
+#include <linux/bitmap.h>
 #include <linux/compiler.h>
 #include <linux/init.h>
 #include <linux/ioprio.h>
@@ -48,6 +49,22 @@
 #include <linux/uaccess.h>
 #include <linux/version.h>
 #include <linux/vmalloc.h>
+
+/*
+ * Synthetic parent pid state, shared between the two halves of the disguise.
+ *
+ * hide_self.c mints it (when an app's getppid() comes back too large) and
+ * hide_pid.c consumes it (translating lookups of that number back to the real
+ * zygote). Declared here because hide_pid.c is included first and would
+ * otherwise not see the definitions.
+ *
+ * fake == 0 means no disguise is active and every path must behave normally.
+ */
+static pid_t hide_self_fake_pid __read_mostly;
+/* the real parent pid hide_self_fake_pid stands for */
+static pid_t hide_self_fake_for __read_mostly;
+/* the real zygote pid, for logging and for the shell to read back */
+static pid_t hide_self_zygote_pid __read_mostly;
 
 #ifndef __ro_after_init
 #define __ro_after_init
