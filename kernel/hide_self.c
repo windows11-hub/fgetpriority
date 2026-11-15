@@ -166,12 +166,21 @@ module_param(hide_self_ppid_limit, int, 0644);
 MODULE_PARM_DESC(hide_self_ppid_limit, "a zygote pid below this is what the detector wants (default 5000)");
 
 /*
- * Width of the bitmap used to reserve a free synthetic pid. It must be at
- * least hide_self_ppid_limit (so every candidate below the limit fits), plus
- * headroom in case the limit is raised. 8192 covers the default 5000 with
- * room to spare while keeping the bitmap at 1 KiB on the kretprobe stack.
+ * The synthetic parent pid is chosen strictly below RESERVED_PIDS (300).
+ *
+ * alloc_pid() hands out pids from [pid_min, pid_max], and pid_min is
+ * RESERVED_PIDS once the cyclic cursor has passed 300 - which it has on any
+ * booted device - so a real process can NEVER be numbered below 300. Putting
+ * the fake pid in [2, 300) therefore makes the translation (find_pid_ns on
+ * the fake number) collision-free forever: no fork can ever claim it, so the
+ * translation can only ever fire on a genuine lookup of the fake number, and
+ * never steals a real process's /proc entry. That is what previously made
+ * some apps fail to open.
+ *
+ * A bitmap sized to this reserved range is 300 bits (5 longs).
  */
-#define HIDE_SELF_FAKE_BITMAP_BITS	8192
+#define HIDE_SELF_FAKE_PID_MAX	300	/* == RESERVED_PIDS, the low reserved range */
+#define HIDE_SELF_FAKE_BITMAP_BITS	512	/* bits covering [0, 512), headroom above 300 */
 
 /*
  * 1 = answer apps with a synthetic parent pid when the real one is too large.
@@ -409,68 +418,48 @@ static int hide_self_kr_getppid_ret(struct kretprobe_instance *ri, struct pt_reg
 static pid_t hide_self_pick_fake_pid(pid_t avoid)
 {
 	struct task_struct *init = (struct task_struct *)hide_self_init_task;
+	DECLARE_BITMAP(used, HIDE_SELF_FAKE_BITMAP_BITS);
+	struct task_struct *p;
 	pid_t candidate;
 	int attempt;
 
-	if (!init || hide_self_ppid_limit <= 2)
+	if (!init)
 		return 0;
 
-	/* deterministic spread rather than get_random_u32(): the value only needs
-	 * to be unpredictable enough not to collide across reboots, and the
-	 * jiffies-based start avoids another header just for this */
-	candidate = 1 + (pid_t)((jiffies_to_msecs(jiffies) + (unsigned long)avoid) %
-				(unsigned int)(hide_self_ppid_limit - 1));
+	bitmap_zero(used, HIDE_SELF_FAKE_BITMAP_BITS);
 
-	/*
-	 * One pass over the task list collecting which low pids are taken, then
-	 * pick from what is left. Scanning per candidate instead would re-walk the
-	 * whole list for every collision, and on a busy device the low range is
-	 * mostly occupied - that is hundreds of full traversals in the worst case.
-	 */
-	/*
-	 * The bitmap must be able to represent every pid below the limit, or a
-	 * limit above the bitmap width would make this function bail out and the
-	 * disguise silently never happen. The limit is a module parameter (default
-	 * 5000), so size the bitmap generously above it and refuse only when the
-	 * configured limit exceeds even that slack.
-	 */
-	{
-		DECLARE_BITMAP(used, HIDE_SELF_FAKE_BITMAP_BITS);
-		struct task_struct *p;
-		unsigned int span;
+	/* mark every pid below the reserved bound that some task currently owns.
+	 * Only boot-time kernel threads live in [2, 300), and they are fixed, so
+	 * the free ones stay free for the life of the boot. */
+	rcu_read_lock();
+	list_for_each_entry_rcu(p, &init->tasks, tasks) {
+		int nr = task_pid_nr(p);
 
-		if (hide_self_ppid_limit <= 2 ||
-		    hide_self_ppid_limit > HIDE_SELF_FAKE_BITMAP_BITS)
-			return 0;
+		if (nr > 1 && nr < HIDE_SELF_FAKE_PID_MAX)
+			__set_bit(nr, used);
+	}
+	rcu_read_unlock();
 
-		bitmap_zero(used, HIDE_SELF_FAKE_BITMAP_BITS);
+	/* pid 0/1 are never valid to hand out */
+	__set_bit(0, used);
+	__set_bit(1, used);
+	if (avoid > 1 && avoid < HIDE_SELF_FAKE_PID_MAX)
+		__set_bit(avoid, used);
 
-		rcu_read_lock();
-		list_for_each_entry_rcu(p, &init->tasks, tasks) {
-			int nr = task_pid_nr(p);
+	/* deterministic spread, but always inside the reserved range */
+	candidate = 2 + (pid_t)((jiffies_to_msecs(jiffies) + (unsigned long)avoid) %
+				(unsigned int)(HIDE_SELF_FAKE_PID_MAX - 2));
 
-			if (nr > 0 && nr < HIDE_SELF_FAKE_BITMAP_BITS)
-				__set_bit(nr, used);
-		}
-		rcu_read_unlock();
+	for (attempt = 0; attempt < HIDE_SELF_FAKE_PID_MAX - 2; attempt++) {
+		if (candidate < 2)
+			candidate = 2;
+		if (candidate >= HIDE_SELF_FAKE_PID_MAX)
+			candidate = 2;
 
-		/* keep pid 0/1 out and never collide with the pid being disguised */
-		__set_bit(0, used);
-		__set_bit(1, used);
-		if (avoid > 0 && avoid < HIDE_SELF_FAKE_BITMAP_BITS)
-			__set_bit(avoid, used);
+		if (!test_bit(candidate, used))
+			return candidate;
 
-		span = (unsigned int)(hide_self_ppid_limit - 1);
-
-		for (attempt = 0; attempt < (int)span; attempt++) {
-			if (candidate <= 1 || candidate >= hide_self_ppid_limit)
-				candidate = 2;
-
-			if (!test_bit(candidate, used))
-				return candidate;
-
-			candidate++;
-		}
+		candidate++;
 	}
 
 	return 0;
