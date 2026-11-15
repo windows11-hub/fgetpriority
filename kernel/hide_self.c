@@ -256,14 +256,15 @@ static int hide_self_restore_period;
 static struct kprobe *kp_seq_decimal;
 
 /*
- * Minting the synthetic pid is NOT done in the kretprobe.
+ * Minting the synthetic pid is NOT done on the fast path.
  *
  * getppid() is one of the busiest syscalls on the device, and reserving a free
  * pid means walking the whole task list. Doing that inline would put a
- * full-list traversal on a hot syscall, inside an RCU read-side section, on
- * every CPU that happens to call it first. Worse, two CPUs racing here would
- * each mint a different number and the last writer would win, so two apps
- * could be told two different parents.
+ * full-list traversal on a hot syscall on every CPU that happens to call it
+ * first. Worse, two CPUs racing here would each mint a different number and
+ * the last writer would win, so two apps could be told two different parents.
+ * The mint is serialised under a spinlock and only runs on the zygote-change
+ * transition, never on the steady-state fast path.
  *
  * So the probe only ever reads. When it finds an oversized parent it hands the
  * work to a single-threaded workqueue and, until that finishes, keeps
@@ -283,18 +284,20 @@ static DEFINE_SPINLOCK(hide_self_mint_lock);
 /*
  * getppid: the discovery channel AND the thing being disguised.
  *
- * SYSCALL_DEFINE0(getppid) ends in
- *      return task_tgid_vnr(current->real_parent);
- * so by the time a kretprobe fires, x0 already holds the answer the kernel
- * computed. For an app that answer IS the pid of whatever forked it, so the
- * syscall hands us the zygote pid for free: no task-list walk, no user-space
- * helper, no post-fs-data report, nothing to keep in sync.
+ * SYSCALL_DEFINE0(getppid) returns task_tgid_vnr(current->real_parent), i.e.
+ * the pid of whatever forked the caller. For an app that is the zygote pid,
+ * which is exactly the value the detector flags. We inline-hook the syscall
+ * entry itself (patch its first instruction to branch here), so there is no
+ * kprobe BRK trap on this very hot path - the hook is a plain branch.
  *
- * That is the whole design. First call from an app records the pid it
- * reported; from then on the same pid is answered with a small synthetic one.
+ * __nocfi: sys_call_table holds this entry and is an indirect call site. On a
+ * CFI kernel an unannotated replacement would trip the forward-edge check.
  */
-static struct kretprobe *kr_getppid;
-static struct kretprobe *kr_compat_getppid;
+static uintptr_t hide_self_orig_getppid;
+static u32 hide_self_orig_insn;
+static bool hide_self_getppid_patched;
+
+static __nocfi long hide_self_gphook_getppid(const struct pt_regs *regs);
 
 /* what we saved before lowering pid_max, so exit can put it back */
 static int hide_self_orig_pid_max;
@@ -320,7 +323,7 @@ static __always_inline bool hide_self_reader_is_app(void)
  * process bookkeeping, which is what made some apps fail to open.
  *
  * Read the comm directly off current->real_parent. No pid lookup, no task
- * walk, no function that this module itself hooks - safe in kretprobe context.
+ * walk, no function that this module itself hooks - safe in the inline hook.
  */
 static __always_inline bool hide_self_parent_is_zygote(void)
 {
@@ -344,91 +347,59 @@ static pid_t hide_self_pick_fake_pid(pid_t avoid);
 /*
  * long __arm64_sys_getppid(const struct pt_regs *regs)
  *
- * On return x0 holds task_tgid_vnr(current->real_parent), i.e. the pid of the
- * process that forked the caller. For an app under zygote that number is the
- * zygote pid, which is exactly what the detector compares against the limit.
+ * Inline hook replacing the whole syscall entry. task_tgid_vnr() is a static
+ * inline, so it cannot be patched at a call site the way find_user() is in
+ * routine_raw.c; the syscall body is all inlined code. The entry's first
+ * instruction is therefore rewritten to branch here, and this function calls
+ * the inlined task_tgid_vnr() directly - the same thing the original did.
  *
- * So the hook needs no discovery pass at all: whatever the syscall just
- * returned is the truth, and the first oversized answer from an app names the
- * zygote we have to disguise. Record it, mint a believable replacement below
- * the limit, and answer with that from then on.
- *
- * Answering with a number that is not a live pid is deliberate here and is
- * safe only because the same disguise covers the lookup side: find_pid_ns and
- * find_task_by_pid_ns translate the fake pid back to the real zygote, so
- * /proc/<fake>/comm returns "zygote64" and every read path agrees. A fake pid
- * without that translation is what crashed the detectors earlier.
+ * That is the whole design: no kprobe trap, one plain branch on a hot path,
+ * and the original value is still computed by the same inlined helper.
  */
-static int hide_self_kr_getppid_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+static __nocfi long hide_self_gphook_getppid(const struct pt_regs *regs)
 {
-	long ret = (long)regs->regs[0];
+	long ret;
 	pid_t fake;
 	pid_t want;
 
+	/* the original body: task_tgid_vnr(current->real_parent) */
+	rcu_read_lock();
+	ret = (long)task_tgid_vnr(rcu_dereference(current->real_parent));
+	rcu_read_unlock();
+
 	/* a small answer is already what a healthy zygote looks like */
-	if (ret <= 0 || ret < (long)hide_self_ppid_limit) {
-		if (hide_self_debug && ret > 0 && ret < (long)hide_self_ppid_limit)
-			pr_info("hide_self: getppid %d already below limit\n", (int)ret);
-		return 0;
-	}
+	if (ret <= 0 || ret < (long)hide_self_ppid_limit)
+		return ret;
 
-	/* only apps are disguised; root/shell/system keep the truth so ps,
-	 * ActivityManager and our own scripts still work */
-	if (!hide_self_reader_is_app()) {
-		if (hide_self_debug)
-			pr_info("hide_self: getppid %d from non-app uid %u, skipped\n",
-				(int)ret, current_uid().val);
-		return 0;
-	}
-
-	/*
-	 * Only disguise a zygote parent. An app forked by another app (exec,
-	 * native fork) reports that app's pid as getppid(), and rewriting that
-	 * number breaks the parent app's process management - the "some apps will
-	 * not open" failure. The detector only ever flags the zygote parent, so
-	 * skipping non-zygote parents costs nothing and stops the corruption.
-	 */
-	if (!hide_self_parent_is_zygote()) {
-		if (hide_self_debug)
-			pr_info("hide_self: getppid %d parent is not zygote, skipped\n",
-				(int)ret);
-		return 0;
-	}
+	/* only apps are disguised; root/shell/system keep the truth */
+	if (!hide_self_reader_is_app())
+		return ret;
 
 	want = (pid_t)ret;
 
-	if (hide_self_debug)
-		pr_info("hide_self: app getppid %d, fake_for=%d fake_pid=%d\n",
-			(int)want, (int)smp_load_acquire(&hide_self_fake_for),
-			(int)smp_load_acquire(&hide_self_fake_pid));
-
 	/*
-	 * Read-only fast path. Answer with the existing disguise if it covers
-	 * this parent; otherwise leave the truth in place and ask for one to be
-	 * minted. Nothing here walks the task list or takes a lock.
+	 * FAST PATH: if this exact parent was already disguised, answer now. A hit
+	 * also proves the parent was a zygote (only zygote parents are ever minted),
+	 * so no comm check is needed on this path.
 	 */
 	if (smp_load_acquire(&hide_self_fake_for) == want) {
 		fake = smp_load_acquire(&hide_self_fake_pid);
 		if (fake > 0)
-			regs->regs[0] = (unsigned long)fake;
-		return 0;
+			return (long)fake;
+		return ret;
 	}
 
 	/*
-	 * The parent changed (zygote restarted) or this is the first oversized
-	 * answer. Re-mint synchronously, right here, so the caller - even a
-	 * detector that just launched after a soft reboot - gets the disguise on
-	 * this same syscall. Deferring to a workqueue left a window in which the
-	 * first getppid() returned the real oversized pid, which is exactly what
-	 * a root detector sees after a soft reboot.
-	 *
-	 * pick_fake_pid is a single rcu_read_lock'ed task walk with no sleeping,
-	 * allocation or lock, so it is safe here. The spinlock only ever runs on
-	 * this zygote-change transition, not the fast path, so contention is nil.
+	 * New parent. Before minting, confirm it is a zygote: an app forked by
+	 * another app reports that app's pid, and disguising it corrupts the parent
+	 * app's bookkeeping (the "some apps will not open" failure). Cold path only.
 	 */
+	if (!hide_self_parent_is_zygote())
+		return ret;
+
+	/* re-mint synchronously so the caller gets the disguise this same syscall */
 	spin_lock(&hide_self_mint_lock);
 
-	/* re-check under the lock: another CPU may have already re-minted */
 	if (smp_load_acquire(&hide_self_fake_for) == want) {
 		fake = smp_load_acquire(&hide_self_fake_pid);
 	} else {
@@ -445,9 +416,8 @@ static int hide_self_kr_getppid_ret(struct kretprobe_instance *ri, struct pt_reg
 	spin_unlock(&hide_self_mint_lock);
 
 	if (fake > 0)
-		regs->regs[0] = (unsigned long)fake;
-
-	return 0;
+		return (long)fake;
+	return ret;
 }
 
 /*
@@ -658,50 +628,66 @@ static void hide_self_restore_fn(struct work_struct *unused)
 /* ------------------------------------------------------------------------ */
 
 /*
- * kretprobe registration. A plain kprobe will not do: the handler has to read
- * the value the original syscall computed, and that only exists once the
- * function has returned.
+ * Inline hook install: rewrite the first instruction of __arm64_sys_getppid
+ * to branch to hide_self_gphook_getppid. The original 4-byte instruction is
+ * saved so exit can restore it. __arm64_sys_getppid is a SYSCALL_DEFINE0, its
+ * body is all inlined code, so there is no call site to patch - the entry
+ * itself is the only hook point.
+ *
+ * Uses the same text-patching primitives routine_raw.c uses (via main.c's
+ * kallsyms-resolved wrappers). __nocfi on the hook keeps the indirect-call
+ * site through sys_call_table from tripping CFI.
  */
-static __init struct kretprobe *hide_self_arm_ret(const char *sym,
-						 kretprobe_handler_t handler)
+static __init int hide_self_patch_getppid(void)
 {
-	struct kretprobe *rp;
+	uintptr_t orig = kallsyms_lookup_name("__arm64_sys_getppid");
+	u32 insn;
+	int ret;
 
-	if (!kallsyms_lookup_name(sym)) {
-		pr_info("hide_self: %s not in kallsyms, skipped\n", sym);
-		return NULL;
+	if (!orig) {
+		pr_info("hide_self: __arm64_sys_getppid not in kallsyms\n");
+		return -ENOENT;
 	}
 
-	rp = kzalloc(sizeof(*rp), GFP_KERNEL);
-	if (!rp)
-		return NULL;
-
-	rp->kp.symbol_name = sym;
-	rp->handler = handler;
-	/* getppid is called by every process constantly; a small pool would run
-	 * dry and silently stop disguising under load */
-	rp->maxactive = 128;
-
-	if (register_kretprobe(rp)) {
-		pr_info("hide_self: register %s kretprobe failed\n", sym);
-		kfree(rp);
-		return NULL;
+	/* save the first instruction for restore */
+	if (copy_from_kernel_nofault(&hide_self_orig_insn, (void *)orig, sizeof(u32))) {
+		pr_info("hide_self: cannot read __arm64_sys_getppid entry\n");
+		return -EFAULT;
 	}
 
-	return rp;
+	insn = aarch64_insn_gen_branch_imm(orig, (unsigned long)hide_self_gphook_getppid,
+					AARCH64_INSN_BRANCH_NOLINK);
+
+	{
+		void *addrs[] = { (void *)orig };
+		u32 insns[] = { insn };
+		ret = aarch64_insn_patch_text(addrs, insns, 1);
+	}
+	if (ret) {
+		pr_info("hide_self: patch getppid entry failed: %d\n", ret);
+		return ret;
+	}
+
+	hide_self_orig_getppid = orig;
+	hide_self_getppid_patched = true;
+	pr_info("hide_self: inline-hooked __arm64_sys_getppid at 0x%lx\n", orig);
+	return 0;
 }
 
-static void hide_self_disarm_ret(struct kretprobe **rp_ptr)
+static void hide_self_unpatch_getppid(void)
 {
-	struct kretprobe *rp = *rp_ptr;
+	void *addrs[1];
+	u32 insns[1];
 
-	if (!rp)
+	if (!hide_self_getppid_patched || !hide_self_orig_getppid)
 		return;
 
-	unregister_kretprobe(rp);
-	synchronize_rcu();
-	kfree(rp);
-	*rp_ptr = NULL;
+	addrs[0] = (void *)hide_self_orig_getppid;
+	insns[0] = hide_self_orig_insn;
+	aarch64_insn_patch_text(addrs, insns, 1);
+
+	hide_self_getppid_patched = false;
+	hide_self_orig_getppid = 0;
 }
 
 static __init int hide_self_init(void)
@@ -729,24 +715,13 @@ static __init int hide_self_init(void)
 		pr_info("hide_self: pid_max not in kallsyms, wrap alternative unavailable\n");
 
 	/*
-	 * The disguise itself. Every app getppid() now passes through here: the
-	 * original syscall computes the real parent pid, and if it is over the
-	 * limit the return value is replaced.
+	 * The disguise itself. Inline-hook __arm64_sys_getppid (patch its entry to
+	 * branch to our function) so the hot path carries no kprobe BRK trap.
 	 */
 	if (!hide_self_getppid_mask) {
 		pr_info("hide_self: getppid masking disabled\n");
-	} else {
-		kr_getppid = hide_self_arm_ret("__arm64_sys_getppid",
-					       hide_self_kr_getppid_ret);
-		if (kr_getppid)
-			armed++;
-
-		/* CONFIG_COMPAT only; a missing symbol on a 64-bit-only kernel is
-		 * expected and must not be treated as a failure */
-		kr_compat_getppid = hide_self_arm_ret("__arm64_compat_sys_getppid",
-						      hide_self_kr_getppid_ret);
-		if (kr_compat_getppid)
-			armed++;
+	} else if (!hide_self_patch_getppid()) {
+		armed++;
 	}
 
 	if (hide_self_seccomp) {
@@ -806,8 +781,7 @@ static void hide_self_exit(void)
 
 	destroy_kprobe(&kp_seq_decimal);
 
-	hide_self_disarm_ret(&kr_getppid);
-	hide_self_disarm_ret(&kr_compat_getppid);
+	hide_self_unpatch_getppid();
 
 	/* always give the allocation range back, even on a failed setup */
 	hide_self_restore_pid_max();
