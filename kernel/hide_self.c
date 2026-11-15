@@ -124,9 +124,15 @@
  * comfortably under the limit while leaving ~3800 allocatable slots, which is
  * far more than the boot sequence needs before zygote comes up.
  */
-static int wrap_pid_max = 4096;
-module_param(wrap_pid_max, int, 0444);
-MODULE_PARM_DESC(wrap_pid_max, "temporary pid_max used to wrap the pid counter below 5000 (default 4096, 0 disables)");
+/*
+ * Optional alternative to masking: lower the allocator ceiling so a restarted
+ * zygote is renumbered for real. Off by default now - masking needs no restart
+ * and no risk window, and the two mechanisms would fight over the same value.
+ * Enable one or the other, never both.
+ */
+static int wrap_pid_max = 0;
+module_param(wrap_pid_max, int, 0644);
+MODULE_PARM_DESC(wrap_pid_max, "non-zero enables the pid counter wrap instead of masking (default 0 = off)");
 
 /*
  * 1 = restart zygote ourselves after wrapping, so the new small pid takes
@@ -159,9 +165,33 @@ static int hide_self_ppid_limit = 5000;
 module_param(hide_self_ppid_limit, int, 0444);
 MODULE_PARM_DESC(hide_self_ppid_limit, "a zygote pid below this is what the detector wants (default 5000)");
 
-static int hide_self_seccomp = 1;
-module_param(hide_self_seccomp, int, 0444);
-MODULE_PARM_DESC(hide_self_seccomp, "1 = report Seccomp: 2 to app readers, 0 = leave untouched");
+/*
+ * 1 = answer apps with a synthetic parent pid when the real one is too large.
+ * This is the primary mechanism; wrap_pid_max below is the alternative for
+ * devices where masking is not wanted and a real renumber is preferred.
+ */
+static int hide_self_getppid_mask = 1;
+module_param(hide_self_getppid_mask, int, 0644);
+MODULE_PARM_DESC(hide_self_getppid_mask, "1 = disguise an oversized getppid() for apps (default 1)");
+
+/*
+ * Off by default.
+ *
+ * The only thing this hook does is rewrite the Seccomp field of
+ * /proc/<pid>/status from 0 to 2 for app readers. To reach that field it
+ * must sit on seq_put_decimal_ull, which prints EVERY number in EVERY
+ * seq_file - meminfo, stat, cpuinfo, mounts, and every /proc/<pid>/status
+ * field. That is the single hottest path a module could possibly hook, and
+ * a detector that times /proc reads sees the constant overhead as a timing
+ * side channel.
+ *
+ * The getppid() disguise is the primary fix and does not need this; Seccomp
+ * is a secondary signal. Leave it off unless a target specifically keys on
+ * Seccomp:0, and accept the timing cost only then.
+ */
+static int hide_self_seccomp = 0;
+module_param(hide_self_seccomp, int, 0644);
+MODULE_PARM_DESC(hide_self_seccomp, "1 = rewrite Seccomp:0 to 2 for apps (default 0, hot path)");
 
 static int hide_self_scan_ms = 5000;
 module_param(hide_self_scan_ms, int, 0444);
@@ -179,6 +209,12 @@ MODULE_PARM_DESC(hide_self_debug, "1 = log hook activity from the rescan timer")
 /* ------------------------------------------------------------------------ */
 
 static uintptr_t hide_self_init_task;
+/* last scan result, so the diagnostic line only prints when it changes */
+static int hide_self_last_scanned = -1;
+static int hide_self_last_apps = -1;
+/* set when at least one app process reports an oversized parent; service.sh
+ * reads this back through the log to decide whether a restart is warranted */
+static int hide_self_need_restart __read_mostly;
 /*
  * &pid_max - the global the cyclic allocator uses as its upper bound.
  *
@@ -191,7 +227,19 @@ static uintptr_t hide_self_init_task;
  */
 static int *hide_self_pid_max;
 
-static pid_t hide_self_zygote_pid __read_mostly;
+/*
+ * The pid handed to apps in place of hide_self_zygote_pid.
+ *
+ * Constraints, all of which matter:
+ *   - below hide_self_ppid_limit, that is the point of the exercise;
+ *   - not already in use, or /proc/<fake> would resolve to some unrelated
+ *     process and the disguise would be worse than the truth;
+ *   - stable for the lifetime of the real zygote, because two wakeups in a
+ *     row must not disagree about who the parent is.
+ *
+ * The two variables themselves live in kernel.h: hide_pid.c is included before
+ * this file and needs to read them to translate lookups of the fake pid.
+ */
 
 static struct delayed_work hide_self_work;
 static int hide_self_period;
@@ -201,6 +249,46 @@ static struct delayed_work hide_self_restore_work;
 static int hide_self_restore_period;
 
 static struct kprobe *kp_seq_decimal;
+
+/*
+ * Minting the synthetic pid is NOT done in the kretprobe.
+ *
+ * getppid() is one of the busiest syscalls on the device, and reserving a free
+ * pid means walking the whole task list. Doing that inline would put a
+ * full-list traversal on a hot syscall, inside an RCU read-side section, on
+ * every CPU that happens to call it first. Worse, two CPUs racing here would
+ * each mint a different number and the last writer would win, so two apps
+ * could be told two different parents.
+ *
+ * So the probe only ever reads. When it finds an oversized parent it hands the
+ * work to a single-threaded workqueue and, until that finishes, keeps
+ * answering honestly. The disguise appears one scheduling round later, which
+ * no detector can observe as a contradiction - it is simply the truth, then
+ * not the truth.
+ */
+static struct work_struct hide_self_mint_work;
+/*
+ * Serialises minting so a burst of concurrent callers queues exactly one work
+ * item. int rather than bool: cmpxchg() needs an atomically addressable
+ * scalar, and a 1-byte bool is not guaranteed to be one on every kernel build.
+ */
+static int hide_self_mint_pending __read_mostly;
+
+/*
+ * getppid: the discovery channel AND the thing being disguised.
+ *
+ * SYSCALL_DEFINE0(getppid) ends in
+ *      return task_tgid_vnr(current->real_parent);
+ * so by the time a kretprobe fires, x0 already holds the answer the kernel
+ * computed. For an app that answer IS the pid of whatever forked it, so the
+ * syscall hands us the zygote pid for free: no task-list walk, no user-space
+ * helper, no post-fs-data report, nothing to keep in sync.
+ *
+ * That is the whole design. First call from an app records the pid it
+ * reported; from then on the same pid is answered with a small synthetic one.
+ */
+static struct kretprobe *kr_getppid;
+static struct kretprobe *kr_compat_getppid;
 
 /* what we saved before lowering pid_max, so exit can put it back */
 static int hide_self_orig_pid_max;
@@ -216,59 +304,347 @@ static __always_inline bool hide_self_reader_is_app(void)
 }
 
 /* ------------------------------------------------------------------------ */
-/* zygote discovery                                                         */
+/* app parent check                                                         */
 /* ------------------------------------------------------------------------ */
 
-static bool hide_self_is_zygote(const char *comm)
+/*
+ * ===========================================================================
+ * What this needs to answer
+ *
+ * The detector reads getppid() from an app process and fails if the value is
+ * above hide_self_ppid_limit. That value is nothing more than
+ *
+ *      current->real_parent->pid
+ *
+ * so the question this file has to answer is exactly:
+ *
+ *      "is there an app process whose parent pid is above the limit?"
+ *
+ * Note what is NOT in that question: the word zygote. There is no need to know
+ * which process is the app zygote, what it is called, or whether it has forked
+ * anything yet. Restarting it does not need its pid either - ctl.restart zygote
+ * addresses it by name. An earlier revision went looking for zygote tasks and
+ * then for their usap children to work out which one mattered, which fails
+ * exactly when it matters most: on a freshly booted or idle device the zygote
+ * has no app children yet, so the enumeration finds nothing and the module
+ * concludes there is nothing to do.
+ *
+ * So: walk the task list once, and report whether any process that looks like
+ * an app has an oversized parent. No names, no child counting, no ordering.
+ * ===========================================================================
+ */
+
+/* an app process: uid >= MIN_APP_PROCESS_UID, i.e. not system/root/kernel */
+static bool hide_self_is_app_task(struct task_struct *p)
 {
-	if (!comm)
+	kuid_t uid;
+
+	if (!p)
 		return false;
 
-	/* zygote64, zygote, zygote32 - the app forking zygotes all share the stem */
-	return !strncmp(comm, "zygote", 6);
+	/* kernel threads have no mm and no uid to speak of */
+	if (!p->mm)
+		return false;
+
+	uid = task_uid(p);
+	return uid.val >= MIN_APP_PROCESS_UID;
 }
 
 /*
  * Process context only (init and the timer), never kprobe context, so the task
- * list may be walked under RCU. No task reference is taken: comm and the pid
- * number are stable while RCU keeps the task alive.
+ * list may be walked under RCU. No task reference is taken: pid numbers and
+ * comm are stable while RCU keeps the task alive.
  */
 static void hide_self_scan(void)
 {
 	struct task_struct *init = (struct task_struct *)hide_self_init_task;
 	struct task_struct *p;
-	pid_t found = 0;
+	pid_t worst_parent = 0;
+	pid_t worst_child = 0;
+	int app_count = 0;
+	int oversized = 0;
+	int scanned = 0;
 
 	if (!init)
 		return;
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(p, &init->tasks, tasks) {
-		pid_t nr;
+		struct task_struct *parent;
+		pid_t ppid;
 
+		scanned++;
+
+		/* one observation per process, not per thread */
 		if (p->group_leader != p)
 			continue;
-		if (!hide_self_is_zygote(p->comm))
+
+		if (!hide_self_is_app_task(p))
 			continue;
 
-		/* zygote/zygote64/zygote32 all show up; the smallest is the oldest */
-		nr = (pid_t)task_pid_nr(p);
-		if (nr > 0 && (!found || nr < found))
-			found = nr;
+		parent = p->real_parent;
+		if (!parent)
+			continue;
+
+		ppid = (pid_t)task_pid_nr(parent);
+		if (ppid <= 0)
+			continue;
+
+		app_count++;
+
+		if (ppid >= hide_self_ppid_limit) {
+			oversized++;
+			if (!worst_parent || ppid > worst_parent) {
+				worst_parent = ppid;
+				worst_child = (pid_t)task_pid_nr(p);
+			}
+		}
 	}
 	rcu_read_unlock();
 
-	if (!found || found == hide_self_zygote_pid)
+	/*
+	 * Report the counts, not just the verdict. A silent zero is what made the
+	 * earlier failure look like a timing race: if the walk itself is broken on
+	 * this kernel, "scan N task(s), 0 app(s)" says so immediately, while a
+	 * silent return said nothing at all.
+	 */
+	if (scanned != hide_self_last_scanned || app_count != hide_self_last_apps) {
+		hide_self_last_scanned = scanned;
+		hide_self_last_apps = app_count;
+		pr_info("hide_self: scan %d task(s), %d app process(es)\n",
+			scanned, app_count);
+	}
+
+	if (!oversized) {
+		smp_store_release(&hide_self_need_restart, 0);
+		if (hide_self_debug)
+			pr_info("hide_self: every app parent is below %d, nothing to fix\n",
+				hide_self_ppid_limit);
 		return;
+	}
 
-	smp_store_release(&hide_self_zygote_pid, found);
+	smp_store_release(&hide_self_need_restart, 1);
 
-	if (found < hide_self_ppid_limit)
-		pr_info("hide_self: zygote pid %d is in range, getppid() needs no help\n",
-			(int)found);
-	else
-		pr_info("hide_self: zygote pid %d is above %d - the pid counter was not wrapped before this zygote started; rerun the wrap and restart zygote\n",
-			(int)found, hide_self_ppid_limit);
+	if (worst_parent != hide_self_zygote_pid) {
+		smp_store_release(&hide_self_zygote_pid, worst_parent);
+		pr_info("hide_self: %d app process(es) have a parent above %d (worst: parent %d of pid %d)\n",
+			oversized, hide_self_ppid_limit,
+			(int)worst_parent, (int)worst_child);
+	}
+}
+
+/*
+ * long __arm64_sys_getppid(const struct pt_regs *regs)
+ *
+ * On return x0 holds task_tgid_vnr(current->real_parent), i.e. the pid of the
+ * process that forked the caller. For an app under zygote that number is the
+ * zygote pid, which is exactly what the detector compares against the limit.
+ *
+ * So the hook needs no discovery pass at all: whatever the syscall just
+ * returned is the truth, and the first oversized answer from an app names the
+ * zygote we have to disguise. Record it, mint a believable replacement below
+ * the limit, and answer with that from then on.
+ *
+ * Answering with a number that is not a live pid is deliberate here and is
+ * safe only because the same disguise covers the lookup side: find_pid_ns and
+ * find_task_by_pid_ns translate the fake pid back to the real zygote, so
+ * /proc/<fake>/comm returns "zygote64" and every read path agrees. A fake pid
+ * without that translation is what crashed the detectors earlier.
+ */
+static int hide_self_kr_getppid_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	long ret = (long)regs->regs[0];
+	pid_t fake;
+	pid_t want;
+
+	/* a small answer is already what a healthy zygote looks like */
+	if (ret <= 0 || ret < (long)hide_self_ppid_limit)
+		return 0;
+
+	/* only apps are disguised; root/shell/system keep the truth so ps,
+	 * ActivityManager and our own scripts still work */
+	if (!hide_self_reader_is_app())
+		return 0;
+
+	want = (pid_t)ret;
+
+	/*
+	 * Read-only fast path. Answer with the existing disguise if it covers
+	 * this parent; otherwise leave the truth in place and ask for one to be
+	 * minted. Nothing here walks the task list or takes a lock.
+	 */
+	if (smp_load_acquire(&hide_self_fake_for) == want) {
+		fake = smp_load_acquire(&hide_self_fake_pid);
+		if (fake > 0)
+			regs->regs[0] = (unsigned long)fake;
+		return 0;
+	}
+
+	/*
+	 * No disguise covers this parent yet. Queue exactly one mint - the flag stops
+	 * a burst of concurrent callers from queueing hundreds of them. The work
+	 * item re-reads the live task list rather than being told what to disguise,
+	 * so a zygote restart between queueing and running is handled correctly
+	 * instead of publishing a mapping for a pid that has gone away.
+	 *
+	 * Until it finishes, callers keep getting the truth. That is not a
+	 * contradiction a detector can see: the syscall simply has not been
+	 * disguised yet.
+	 */
+	if (!cmpxchg(&hide_self_mint_pending, 0, 1))
+		schedule_work(&hide_self_mint_work);
+
+	return 0;
+}
+
+/*
+ * Pick a synthetic pid below the limit that no live task currently owns.
+ *
+ * Reusing an occupied number would make /proc/<fake> resolve to a real but
+ * unrelated process - an app that looks up its own reported parent would see
+ * a stranger's comm, which is far more damning than a large pid. The walk is
+ * cheap enough here because this only runs when the disguise is (re)built.
+ */
+static pid_t hide_self_pick_fake_pid(pid_t avoid)
+{
+	struct task_struct *init = (struct task_struct *)hide_self_init_task;
+	pid_t candidate;
+	int attempt;
+
+	if (!init || hide_self_ppid_limit <= 2)
+		return 0;
+
+	/* deterministic spread rather than get_random_u32(): the value only needs
+	 * to be unpredictable enough not to collide across reboots, and the
+	 * jiffies-based start avoids another header just for this */
+	candidate = 1 + (pid_t)((jiffies_to_msecs(jiffies) + (unsigned long)avoid) %
+				(unsigned int)(hide_self_ppid_limit - 1));
+
+	/*
+	 * One pass over the task list collecting which low pids are taken, then
+	 * pick from what is left. Scanning per candidate instead would re-walk the
+	 * whole list for every collision, and on a busy device the low range is
+	 * mostly occupied - that is hundreds of full traversals in the worst case.
+	 */
+	{
+		DECLARE_BITMAP(used, 4096);
+		struct task_struct *p;
+		unsigned int span;
+
+		if (hide_self_ppid_limit > 4096)
+			return 0;
+
+		bitmap_zero(used, 4096);
+
+		rcu_read_lock();
+		list_for_each_entry_rcu(p, &init->tasks, tasks) {
+			int nr = task_pid_nr(p);
+
+			if (nr > 0 && nr < 4096)
+				__set_bit(nr, used);
+		}
+		rcu_read_unlock();
+
+		/* keep pid 0/1 out and never collide with the pid being disguised */
+		__set_bit(0, used);
+		__set_bit(1, used);
+		if (avoid > 0 && avoid < 4096)
+			__set_bit(avoid, used);
+
+		span = (unsigned int)(hide_self_ppid_limit - 1);
+
+		for (attempt = 0; attempt < (int)span; attempt++) {
+			if (candidate <= 1 || candidate >= hide_self_ppid_limit)
+				candidate = 2;
+
+			if (!test_bit(candidate, used))
+				return candidate;
+
+			candidate++;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * Runs in process context, one at a time: reserve a pid below the limit that no
+ * task owns, and publish it as the disguise for whatever parent the live scan
+ * currently reports as oversized.
+ */
+/*
+ * What the disguise should currently cover: the largest parent pid seen among
+ * app processes, or 0 when every app parent is already below the limit.
+ *
+ * This deliberately re-reads the live task list instead of trusting the value
+ * recorded when the work was queued. Between queueing and running, the zygote
+ * may have restarted; disguising the pid that was current at queue time would
+ * publish a mapping for a process that no longer exists, and the new one would
+ * never be covered because the pending flag suppressed the second request.
+ */
+static pid_t hide_self_find_oversized_parent(void)
+{
+	struct task_struct *init = (struct task_struct *)hide_self_init_task;
+	struct task_struct *p;
+	pid_t worst = 0;
+
+	if (!init)
+		return 0;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(p, &init->tasks, tasks) {
+		struct task_struct *parent;
+		pid_t ppid;
+
+		if (p->group_leader != p)
+			continue;
+		if (!hide_self_is_app_task(p))
+			continue;
+
+		parent = p->real_parent;
+		if (!parent)
+			continue;
+
+		ppid = (pid_t)task_pid_nr(parent);
+		if (ppid >= hide_self_ppid_limit && ppid > worst)
+			worst = ppid;
+	}
+	rcu_read_unlock();
+
+	return worst;
+}
+
+static void hide_self_mint_fn(struct work_struct *unused)
+{
+	pid_t want;
+	pid_t fake;
+
+	want = hide_self_find_oversized_parent();
+	if (want <= 0)
+		goto out;	/* nothing oversized any more, leave the truth */
+
+	/* already disguised for exactly this parent? keep it, do not reshuffle */
+	if (smp_load_acquire(&hide_self_fake_for) == want &&
+	    smp_load_acquire(&hide_self_fake_pid) > 0)
+		goto out;
+
+	fake = hide_self_pick_fake_pid(want);
+	if (!fake) {
+		pr_info("hide_self: no free pid below %d to mask %d with\n",
+			hide_self_ppid_limit, (int)want);
+		goto out;
+	}
+
+	/* publish the target first: a reader that sees a matching fake_for is then
+	 * guaranteed to also see a finished fake_pid (acquire/release pairing) */
+	smp_store_release(&hide_self_fake_pid, fake);
+	smp_store_release(&hide_self_fake_for, want);
+	smp_store_release(&hide_self_zygote_pid, want);
+
+	pr_info("hide_self: masking parent pid %d as %d\n", (int)want, (int)fake);
+
+out:
+	smp_store_release(&hide_self_mint_pending, 0);
 }
 
 static void hide_self_scan_fn(struct work_struct *unused)
@@ -429,6 +805,53 @@ static void hide_self_restore_fn(struct work_struct *unused)
 /* init / exit                                                              */
 /* ------------------------------------------------------------------------ */
 
+/*
+ * kretprobe registration. A plain kprobe will not do: the handler has to read
+ * the value the original syscall computed, and that only exists once the
+ * function has returned.
+ */
+static __init struct kretprobe *hide_self_arm_ret(const char *sym,
+						 kretprobe_handler_t handler)
+{
+	struct kretprobe *rp;
+
+	if (!kallsyms_lookup_name(sym)) {
+		pr_info("hide_self: %s not in kallsyms, skipped\n", sym);
+		return NULL;
+	}
+
+	rp = kzalloc(sizeof(*rp), GFP_KERNEL);
+	if (!rp)
+		return NULL;
+
+	rp->kp.symbol_name = sym;
+	rp->handler = handler;
+	/* getppid is called by every process constantly; a small pool would run
+	 * dry and silently stop disguising under load */
+	rp->maxactive = 128;
+
+	if (register_kretprobe(rp)) {
+		pr_info("hide_self: register %s kretprobe failed\n", sym);
+		kfree(rp);
+		return NULL;
+	}
+
+	return rp;
+}
+
+static void hide_self_disarm_ret(struct kretprobe **rp_ptr)
+{
+	struct kretprobe *rp = *rp_ptr;
+
+	if (!rp)
+		return;
+
+	unregister_kretprobe(rp);
+	synchronize_rcu();
+	kfree(rp);
+	*rp_ptr = NULL;
+}
+
 static __init int hide_self_init(void)
 {
 	int armed = 0;
@@ -451,12 +874,28 @@ static __init int hide_self_init(void)
 		hide_self_scan_ms = HIDE_SELF_SCAN_MIN_MS;
 	}
 
-	hide_self_scan();
+	/*
+	 * The disguise itself. Every app getppid() now passes through here: the
+	 * original syscall computes the real parent pid, and if it is over the
+	 * limit the return value is replaced.
+	 */
+	if (!hide_self_getppid_mask) {
+		pr_info("hide_self: getppid masking disabled\n");
+	} else {
+		kr_getppid = hide_self_arm_ret("__arm64_sys_getppid",
+					       hide_self_kr_getppid_ret);
+		if (kr_getppid)
+			armed++;
 
-	/* the counter wrap is the actual fix; the Seccomp field is the only
-	 * remaining hook and it exists because that value has no sibling */
-	if (!hide_self_wrap_pid_max())
-		armed++;
+		/* CONFIG_COMPAT only; a missing symbol on a 64-bit-only kernel is
+		 * expected and must not be treated as a failure */
+		kr_compat_getppid = hide_self_arm_ret("__arm64_compat_sys_getppid",
+						      hide_self_kr_getppid_ret);
+		if (kr_compat_getppid)
+			armed++;
+	}
+
+	INIT_WORK(&hide_self_mint_work, hide_self_mint_fn);
 
 	if (hide_self_seccomp) {
 		kp_seq_decimal = init_kprobe("seq_put_decimal_ull",
@@ -517,8 +956,18 @@ static void hide_self_exit(void)
 
 	destroy_kprobe(&kp_seq_decimal);
 
+	hide_self_disarm_ret(&kr_getppid);
+	hide_self_disarm_ret(&kr_compat_getppid);
+
+	/* no probe fires now, but a mint queued just before disarming could still
+	 * be pending; let it run out rather than freeing state underneath it */
+	cancel_work_sync(&hide_self_mint_work);
+
 	/* always give the allocation range back, even on a failed setup */
 	hide_self_restore_pid_max();
 
+	/* drop the disguise so nothing keeps translating a pid we no longer own */
+	smp_store_release(&hide_self_fake_pid, 0);
+	smp_store_release(&hide_self_fake_for, 0);
 	smp_store_release(&hide_self_zygote_pid, 0);
 }
