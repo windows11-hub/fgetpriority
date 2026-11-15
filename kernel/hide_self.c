@@ -206,7 +206,7 @@ MODULE_PARM_DESC(hide_self_getppid_mask, "1 = disguise an oversized getppid() fo
  * is a secondary signal. Leave it off unless a target specifically keys on
  * Seccomp:0, and accept the timing cost only then.
  */
-static int hide_self_seccomp = 0;
+static int hide_self_seccomp = 1;
 module_param(hide_self_seccomp, int, 0644);
 MODULE_PARM_DESC(hide_self_seccomp, "1 = rewrite Seccomp:0 to 2 for apps (default 0, hot path)");
 
