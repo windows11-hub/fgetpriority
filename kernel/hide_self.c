@@ -193,28 +193,16 @@ static int hide_self_seccomp = 0;
 module_param(hide_self_seccomp, int, 0644);
 MODULE_PARM_DESC(hide_self_seccomp, "1 = rewrite Seccomp:0 to 2 for apps (default 0, hot path)");
 
-static int hide_self_scan_ms = 5000;
-module_param(hide_self_scan_ms, int, 0444);
-MODULE_PARM_DESC(hide_self_scan_ms, "zygote re-lookup interval in ms, 0 disables the timer");
-
 /* diagnostics; off by default because the status hook runs on a hot path */
 static int hide_self_debug;
 module_param(hide_self_debug, int, 0444);
 MODULE_PARM_DESC(hide_self_debug, "1 = log hook activity from the rescan timer");
-
-#define HIDE_SELF_SCAN_MIN_MS	1000
 
 /* ------------------------------------------------------------------------ */
 /* state                                                                    */
 /* ------------------------------------------------------------------------ */
 
 static uintptr_t hide_self_init_task;
-/* last scan result, so the diagnostic line only prints when it changes */
-static int hide_self_last_scanned = -1;
-static int hide_self_last_apps = -1;
-/* set when at least one app process reports an oversized parent; service.sh
- * reads this back through the log to decide whether a restart is warranted */
-static int hide_self_need_restart __read_mostly;
 /*
  * &pid_max - the global the cyclic allocator uses as its upper bound.
  *
@@ -241,8 +229,6 @@ static int *hide_self_pid_max;
  * this file and needs to read them to translate lookups of the fake pid.
  */
 
-static struct delayed_work hide_self_work;
-static int hide_self_period;
 /* restores pid_max after the danger window, so a low ceiling cannot starve
  * the pid allocator and break fork() system-wide */
 static struct delayed_work hide_self_restore_work;
@@ -348,89 +334,6 @@ static bool hide_self_is_app_task(struct task_struct *p)
 
 	uid = task_uid(p);
 	return uid.val >= MIN_APP_PROCESS_UID;
-}
-
-/*
- * Process context only (init and the timer), never kprobe context, so the task
- * list may be walked under RCU. No task reference is taken: pid numbers and
- * comm are stable while RCU keeps the task alive.
- */
-static void hide_self_scan(void)
-{
-	struct task_struct *init = (struct task_struct *)hide_self_init_task;
-	struct task_struct *p;
-	pid_t worst_parent = 0;
-	pid_t worst_child = 0;
-	int app_count = 0;
-	int oversized = 0;
-	int scanned = 0;
-
-	if (!init)
-		return;
-
-	rcu_read_lock();
-	list_for_each_entry_rcu(p, &init->tasks, tasks) {
-		struct task_struct *parent;
-		pid_t ppid;
-
-		scanned++;
-
-		/* one observation per process, not per thread */
-		if (p->group_leader != p)
-			continue;
-
-		if (!hide_self_is_app_task(p))
-			continue;
-
-		parent = p->real_parent;
-		if (!parent)
-			continue;
-
-		ppid = (pid_t)task_pid_nr(parent);
-		if (ppid <= 0)
-			continue;
-
-		app_count++;
-
-		if (ppid >= hide_self_ppid_limit) {
-			oversized++;
-			if (!worst_parent || ppid > worst_parent) {
-				worst_parent = ppid;
-				worst_child = (pid_t)task_pid_nr(p);
-			}
-		}
-	}
-	rcu_read_unlock();
-
-	/*
-	 * Report the counts, not just the verdict. A silent zero is what made the
-	 * earlier failure look like a timing race: if the walk itself is broken on
-	 * this kernel, "scan N task(s), 0 app(s)" says so immediately, while a
-	 * silent return said nothing at all.
-	 */
-	if (scanned != hide_self_last_scanned || app_count != hide_self_last_apps) {
-		hide_self_last_scanned = scanned;
-		hide_self_last_apps = app_count;
-		pr_info("hide_self: scan %d task(s), %d app process(es)\n",
-			scanned, app_count);
-	}
-
-	if (!oversized) {
-		smp_store_release(&hide_self_need_restart, 0);
-		if (hide_self_debug)
-			pr_info("hide_self: every app parent is below %d, nothing to fix\n",
-				hide_self_ppid_limit);
-		return;
-	}
-
-	smp_store_release(&hide_self_need_restart, 1);
-
-	if (worst_parent != hide_self_zygote_pid) {
-		smp_store_release(&hide_self_zygote_pid, worst_parent);
-		pr_info("hide_self: %d app process(es) have a parent above %d (worst: parent %d of pid %d)\n",
-			oversized, hide_self_ppid_limit,
-			(int)worst_parent, (int)worst_child);
-	}
 }
 
 /*
@@ -647,15 +550,6 @@ out:
 	smp_store_release(&hide_self_mint_pending, 0);
 }
 
-static void hide_self_scan_fn(struct work_struct *unused)
-{
-	hide_self_scan();
-
-	if (hide_self_period > 0)
-		schedule_delayed_work(&hide_self_work,
-				      msecs_to_jiffies((unsigned int)hide_self_period));
-}
-
 /* ------------------------------------------------------------------------ */
 /* Seccomp: 0 -> 2                                                          */
 /* ------------------------------------------------------------------------ */
@@ -868,12 +762,6 @@ static __init int hide_self_init(void)
 		return -ENOENT;
 	}
 
-	if (hide_self_scan_ms > 0 && hide_self_scan_ms < HIDE_SELF_SCAN_MIN_MS) {
-		pr_info("hide_self: hide_self_scan_ms=%d too small, clamped to %d\n",
-			hide_self_scan_ms, HIDE_SELF_SCAN_MIN_MS);
-		hide_self_scan_ms = HIDE_SELF_SCAN_MIN_MS;
-	}
-
 	/*
 	 * The disguise itself. Every app getppid() now passes through here: the
 	 * original syscall computes the real parent pid, and if it is over the
@@ -902,13 +790,6 @@ static __init int hide_self_init(void)
 					     (kprobe_pre_handler_t)hide_self_kp_seq_decimal_pre);
 		if (kp_seq_decimal)
 			armed++;
-	}
-
-	if (hide_self_scan_ms > 0) {
-		hide_self_period = hide_self_scan_ms;
-		INIT_DELAYED_WORK(&hide_self_work, hide_self_scan_fn);
-		schedule_delayed_work(&hide_self_work,
-				      msecs_to_jiffies((unsigned int)hide_self_period));
 	}
 
 	if (hide_self_pid_max_lowered) {
@@ -944,11 +825,6 @@ static __init int hide_self_init(void)
 
 static void hide_self_exit(void)
 {
-	if (hide_self_period > 0) {
-		hide_self_period = 0;
-		cancel_delayed_work_sync(&hide_self_work);
-	}
-
 	if (hide_self_restore_period > 0) {
 		hide_self_restore_period = 0;
 		cancel_delayed_work_sync(&hide_self_restore_work);
