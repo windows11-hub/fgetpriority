@@ -65,25 +65,34 @@ fi
 # ---- zygote restart so the new pid range takes effect ---------------------
 # Lowering pid_max only changes where the NEXT allocation lands. The zygote
 # that is already running keeps its large pid, and every app inherits that
-# number through getppid(). Restarting zygote is what makes it re-fork into
-# the wrapped range, which is the whole point.
+# number through getppid(). Restarting it is what makes it re-fork into the
+# wrapped range, which is the whole point.
 #
-# Guarded: the module only wrapped the counter if it was actually above the
-# ceiling. If zygote is already small, restarting it would reboot every app
-# for nothing.
-_cur_zygote=$(for p in /proc/[0-9]*/comm; do
-	[ -r "$p" ] || continue
-	case "$(cat "$p" 2>/dev/null)" in
-	zygote*) basename "${p%/comm}"; break ;;
-	esac
-done | head -n1)
+# The module does the identification, not this script.
+#
+# Walking /proc from the shell was wrong for two reasons. It takes the first
+# zygote* it meets, and /proc is ordered by pid, so on a device that has grown
+# a stale "zygote" plus two "zygote64" the first hit is often not the process
+# apps hang off - the real one was 13406 while the script decided 1827 and
+# concluded nothing needed doing. And a shell cannot tell which zygote is the
+# app parent at all; the kernel can, by counting usap children.
+#
+# So: read the verdict from the module's own log.
+#
+# The module answers one question - "does any app process report a parent
+# above the limit?" - and prints a line naming the worst parent when the
+# answer is yes. It needs no polling for a zygote name and no app children to
+# exist: an app process that is running at all is enough to answer it.
+_verdict=$(dmesg | sed -n 's/.*hide_self: \([0-9]\+\) app process(es) have a parent above.*/RESTART/p; s/.*hide_self: every app parent is below.*/CLEAN/p' | tail -n1)
+_worst=$(dmesg | sed -n 's/.*have a parent above [0-9]\+ (worst: parent \([0-9]\+\) of pid [0-9]\+).*/\1/p' | tail -n1)
 
-if [ "$WRAP_RESTART_ZYGOTE" = "1" ] && [ -n "$_cur_zygote" ] && \
-   [ "$_cur_zygote" -ge 5000 ] 2>/dev/null; then
-	echo "fgetpriority: zygote pid $_cur_zygote is above 5000, restarting it" >&2
-	setprop ctl.restart zygote 2>/dev/null || true
+if [ "$WRAP_RESTART_ZYGOTE" != "1" ]; then
+	echo "fgetpriority: restart disabled, run 'setprop ctl.restart zygote' yourself" >&2
+elif [ "$_verdict" != "RESTART" ]; then
+	echo "fgetpriority: no oversized app parent seen (${_verdict:-no scan yet}), nothing to restart" >&2
 else
-	echo "fgetpriority: zygote pid ${_cur_zygote:-unknown} needs no restart" >&2
+	echo "fgetpriority: an app parent is at pid ${_worst:-unknown}, above 5000 - restarting zygote" >&2
+	setprop ctl.restart zygote 2>/dev/null || true
 fi
 
 # ---- verify ---------------------------------------------------------------
