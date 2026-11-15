@@ -316,19 +316,20 @@ static int __init fgetpriority_init(void)
 	 * Three independent features are armed here:
 	 *   1. the priority/ioprio uid filter (routine_raw.c, kprobes fallback)
 	 *   2. the pid filter (hide_pid.c, kprobes only): hides the ksud daemon
-	 *   3. the temporary-root fix (hide_self.c): wraps the pid counter so a
-	 *      restarted zygote takes a REAL small pid, plus a Seccomp rewrite
+	 *   3. the temporary-root fix (hide_self.c): disguises an oversized
+	 *      getppid() for app processes (kretprobe on __arm64_sys_getppid),
+	 *      with the pid-counter wrap as an OFF-by-default alternative and a
+	 *      Seccomp rewrite as an OFF-by-default extra.
 	 *
 	 * Any one alone is useful, so a failure in one must not stop the
 	 * others. Only "all failed" makes the module pointless.
 	 *
-	 * ORDER MATTERS for (3) and it is not cosmetic. hide_self_init() lowers
-	 * init_pid_ns.pid_max, and while that ceiling is down the allocatable
-	 * range is only [RESERVED_PIDS, pid_max) - the low hundreds are already
-	 * taken by init, kthreadd and the kworkers at boot. So the dangerous
-	 * window has to be as short as possible and must not be widened by
-	 * another subsystem's setup running inside it. Hence: arm (3) LAST, and
-	 * tear it down FIRST.
+	 * ORDER: hide_self_init() is armed last and torn down first. The masking
+	 * path is cheap and has no dangerous window, but when the pid-counter
+	 * wrap alternative is enabled (wrap_pid_max > 0) it temporarily lowers
+	 * pid_max to [RESERVED_PIDS, pid_max), most of which is already taken, so
+	 * that window must stay as short as possible and not be widened by another
+	 * subsystem's setup running inside it.
 	 */
 	/*
 	 * Branch patching (routine_raw.c) is OFF by default, and this is not a
