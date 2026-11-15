@@ -750,17 +750,25 @@ static __init int hide_self_init(void)
 {
 	int armed = 0;
 
+	/*
+	 * init_task is needed by the mint work (it scans the task list for a free
+	 * pid), so it is a hard dependency of the masking path too.
+	 */
 	hide_self_init_task = kallsyms_lookup_name("init_task");
 	if (!hide_self_init_task) {
 		pr_info("hide_self: init_task not in kallsyms\n");
 		return -ENOENT;
 	}
 
+	/*
+	 * pid_max is only used by the wrap alternative (wrap_pid_max > 0). The
+	 * getppid() masking path never touches it, so a kernel that does not export
+	 * the symbol must not take masking down with it: resolve it, but treat a
+	 * miss as "wrap unavailable" rather than a fatal error.
+	 */
 	hide_self_pid_max = (int *)kallsyms_lookup_name("pid_max");
-	if (!hide_self_pid_max) {
-		pr_info("hide_self: pid_max not in kallsyms, cannot wrap the counter\n");
-		return -ENOENT;
-	}
+	if (!hide_self_pid_max)
+		pr_info("hide_self: pid_max not in kallsyms, wrap alternative unavailable\n");
 
 	/*
 	 * The disguise itself. Every app getppid() now passes through here: the
@@ -792,7 +800,17 @@ static __init int hide_self_init(void)
 			armed++;
 	}
 
-	if (hide_self_pid_max_lowered) {
+	/*
+	 * Optional alternative to masking: wrap_pid_max > 0 lowers the allocator
+	 * ceiling so a RESTARTED zygote is renumbered for real. It is off by
+	 * default because it needs a zygote restart to take effect and it opens a
+	 * window in which the low pid range can starve fork(). Only run it when
+	 * explicitly requested, and never together with masking.
+	 */
+	if (wrap_pid_max > 0) {
+		if (!hide_self_wrap_pid_max())
+			armed++;
+
 		/*
 		 * Start the countdown that gives the allocation range back.
 		 *
@@ -801,7 +819,7 @@ static __init int hide_self_init(void)
 		 * fork() system-wide. The timer guarantees the dangerous state is
 		 * temporary even if nobody unloads the module or restarts zygote.
 		 */
-		if (wrap_restore_ms > 0) {
+		if (hide_self_pid_max_lowered && wrap_restore_ms > 0) {
 			hide_self_restore_period = wrap_restore_ms;
 			INIT_DELAYED_WORK(&hide_self_restore_work, hide_self_restore_fn);
 			schedule_delayed_work(&hide_self_restore_work,
