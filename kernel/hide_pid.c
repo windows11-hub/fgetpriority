@@ -135,7 +135,7 @@
  * 7. KNOWN GAPS (by design, not bugs)
  *
  *  - Table-wide walks that never name a pid are untouched: kill(-1, 0) still
- *    returns 0. getpriority(PRIO_USER, uid), the channel the 春秋 detector uses
+ *    returns 0. getpriority(PRIO_USER, uid), the channel the 鏄ョ detector uses
  *    for its "hidden app list" check, is already handled by routine_raw.c.
  *  - Thread ids are not filtered; the match key is the group leader pid, which
  *    is what task_pid_nr()/ps show.
@@ -201,7 +201,15 @@ static char *hide_comm_list = "";
 module_param(hide_comm_list, charp, 0444);
 MODULE_PARM_DESC(hide_comm_list, "comma separated comm names to hide (empty = hide nothing)");
 
-static int hide_scan_ms = 1000;
+/*
+ * Rescan interval. The default used to be 1000ms, but a full task-list walk
+ * plus a snapshot allocation every second is a constant source of jitter on
+ * fork() and /proc reads - exactly what makes MT Manager and Settings open
+ * slowly. ksud is a fixed boot daemon whose pid only changes when it is
+ * restarted, which is rare; 30s is plenty, and the kprobe path still filters
+ * instantly in between rescans.
+ */
+static int hide_scan_ms = 30000;
 module_param(hide_scan_ms, int, 0444);
 MODULE_PARM_DESC(hide_scan_ms, "rescan interval in ms used to re-locate the target, 0 disables rescan");
 
