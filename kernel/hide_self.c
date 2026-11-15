@@ -290,6 +290,9 @@ static __always_inline bool hide_self_reader_is_app(void)
 	return current_uid().val >= MIN_APP_PROCESS_UID;
 }
 
+/* forward decl: defined below, after the getppid handler that calls it */
+static pid_t hide_self_pick_fake_pid(pid_t avoid);
+
 /*
  * long __arm64_sys_getppid(const struct pt_regs *regs)
  *
