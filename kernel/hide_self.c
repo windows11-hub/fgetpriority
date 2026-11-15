@@ -252,13 +252,14 @@ static struct kprobe *kp_seq_decimal;
  * no detector can observe as a contradiction - it is simply the truth, then
  * not the truth.
  */
-static struct work_struct hide_self_mint_work;
 /*
- * Serialises minting so a burst of concurrent callers queues exactly one work
- * item. int rather than bool: cmpxchg() needs an atomically addressable
- * scalar, and a 1-byte bool is not guaranteed to be one on every kernel build.
+ * Serialises the (rare) synchronous re-mint when the zygote pid changes. It
+ * is taken only on that transition, never on the getppid() fast path, so it
+ * cannot become a contended hot lock. A spinlock rather than a mutex: the
+ * pick runs under rcu_read_lock (preempt disabled), where a mutex cannot be
+ * taken.
  */
-static int hide_self_mint_pending __read_mostly;
+static DEFINE_SPINLOCK(hide_self_mint_lock);
 
 /*
  * getppid: the discovery channel AND the thing being disguised.
@@ -287,53 +288,6 @@ static bool hide_self_pid_max_lowered;
 static __always_inline bool hide_self_reader_is_app(void)
 {
 	return current_uid().val >= MIN_APP_PROCESS_UID;
-}
-
-/* ------------------------------------------------------------------------ */
-/* app parent check                                                         */
-/* ------------------------------------------------------------------------ */
-
-/*
- * ===========================================================================
- * What this needs to answer
- *
- * The detector reads getppid() from an app process and fails if the value is
- * above hide_self_ppid_limit. That value is nothing more than
- *
- *      current->real_parent->pid
- *
- * so the question this file has to answer is exactly:
- *
- *      "is there an app process whose parent pid is above the limit?"
- *
- * Note what is NOT in that question: the word zygote. There is no need to know
- * which process is the app zygote, what it is called, or whether it has forked
- * anything yet. Restarting it does not need its pid either - ctl.restart zygote
- * addresses it by name. An earlier revision went looking for zygote tasks and
- * then for their usap children to work out which one mattered, which fails
- * exactly when it matters most: on a freshly booted or idle device the zygote
- * has no app children yet, so the enumeration finds nothing and the module
- * concludes there is nothing to do.
- *
- * So: walk the task list once, and report whether any process that looks like
- * an app has an oversized parent. No names, no child counting, no ordering.
- * ===========================================================================
- */
-
-/* an app process: uid >= MIN_APP_PROCESS_UID, i.e. not system/root/kernel */
-static bool hide_self_is_app_task(struct task_struct *p)
-{
-	kuid_t uid;
-
-	if (!p)
-		return false;
-
-	/* kernel threads have no mm and no uid to speak of */
-	if (!p->mm)
-		return false;
-
-	uid = task_uid(p);
-	return uid.val >= MIN_APP_PROCESS_UID;
 }
 
 /*
@@ -384,18 +338,37 @@ static int hide_self_kr_getppid_ret(struct kretprobe_instance *ri, struct pt_reg
 	}
 
 	/*
-	 * No disguise covers this parent yet. Queue exactly one mint - the flag stops
-	 * a burst of concurrent callers from queueing hundreds of them. The work
-	 * item re-reads the live task list rather than being told what to disguise,
-	 * so a zygote restart between queueing and running is handled correctly
-	 * instead of publishing a mapping for a pid that has gone away.
+	 * The parent changed (zygote restarted) or this is the first oversized
+	 * answer. Re-mint synchronously, right here, so the caller - even a
+	 * detector that just launched after a soft reboot - gets the disguise on
+	 * this same syscall. Deferring to a workqueue left a window in which the
+	 * first getppid() returned the real oversized pid, which is exactly what
+	 * a root detector sees after a soft reboot.
 	 *
-	 * Until it finishes, callers keep getting the truth. That is not a
-	 * contradiction a detector can see: the syscall simply has not been
-	 * disguised yet.
+	 * pick_fake_pid is a single rcu_read_lock'ed task walk with no sleeping,
+	 * allocation or lock, so it is safe here. The spinlock only ever runs on
+	 * this zygote-change transition, not the fast path, so contention is nil.
 	 */
-	if (!cmpxchg(&hide_self_mint_pending, 0, 1))
-		schedule_work(&hide_self_mint_work);
+	spin_lock(&hide_self_mint_lock);
+
+	/* re-check under the lock: another CPU may have already re-minted */
+	if (smp_load_acquire(&hide_self_fake_for) == want) {
+		fake = smp_load_acquire(&hide_self_fake_pid);
+	} else {
+		fake = hide_self_pick_fake_pid(want);
+		if (fake > 0) {
+			smp_store_release(&hide_self_fake_pid, fake);
+			smp_store_release(&hide_self_fake_for, want);
+			smp_store_release(&hide_self_zygote_pid, want);
+			pr_info("hide_self: masking parent pid %d as %d\n",
+				(int)want, (int)fake);
+		}
+	}
+
+	spin_unlock(&hide_self_mint_lock);
+
+	if (fake > 0)
+		regs->regs[0] = (unsigned long)fake;
 
 	return 0;
 }
@@ -468,86 +441,6 @@ static pid_t hide_self_pick_fake_pid(pid_t avoid)
 	}
 
 	return 0;
-}
-
-/*
- * Runs in process context, one at a time: reserve a pid below the limit that no
- * task owns, and publish it as the disguise for whatever parent the live scan
- * currently reports as oversized.
- */
-/*
- * What the disguise should currently cover: the largest parent pid seen among
- * app processes, or 0 when every app parent is already below the limit.
- *
- * This deliberately re-reads the live task list instead of trusting the value
- * recorded when the work was queued. Between queueing and running, the zygote
- * may have restarted; disguising the pid that was current at queue time would
- * publish a mapping for a process that no longer exists, and the new one would
- * never be covered because the pending flag suppressed the second request.
- */
-static pid_t hide_self_find_oversized_parent(void)
-{
-	struct task_struct *init = (struct task_struct *)hide_self_init_task;
-	struct task_struct *p;
-	pid_t worst = 0;
-
-	if (!init)
-		return 0;
-
-	rcu_read_lock();
-	list_for_each_entry_rcu(p, &init->tasks, tasks) {
-		struct task_struct *parent;
-		pid_t ppid;
-
-		if (p->group_leader != p)
-			continue;
-		if (!hide_self_is_app_task(p))
-			continue;
-
-		parent = p->real_parent;
-		if (!parent)
-			continue;
-
-		ppid = (pid_t)task_pid_nr(parent);
-		if (ppid >= hide_self_ppid_limit && ppid > worst)
-			worst = ppid;
-	}
-	rcu_read_unlock();
-
-	return worst;
-}
-
-static void hide_self_mint_fn(struct work_struct *unused)
-{
-	pid_t want;
-	pid_t fake;
-
-	want = hide_self_find_oversized_parent();
-	if (want <= 0)
-		goto out;	/* nothing oversized any more, leave the truth */
-
-	/* already disguised for exactly this parent? keep it, do not reshuffle */
-	if (smp_load_acquire(&hide_self_fake_for) == want &&
-	    smp_load_acquire(&hide_self_fake_pid) > 0)
-		goto out;
-
-	fake = hide_self_pick_fake_pid(want);
-	if (!fake) {
-		pr_info("hide_self: no free pid below %d to mask %d with\n",
-			hide_self_ppid_limit, (int)want);
-		goto out;
-	}
-
-	/* publish the target first: a reader that sees a matching fake_for is then
-	 * guaranteed to also see a finished fake_pid (acquire/release pairing) */
-	smp_store_release(&hide_self_fake_pid, fake);
-	smp_store_release(&hide_self_fake_for, want);
-	smp_store_release(&hide_self_zygote_pid, want);
-
-	pr_info("hide_self: masking parent pid %d as %d\n", (int)want, (int)fake);
-
-out:
-	smp_store_release(&hide_self_mint_pending, 0);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -791,8 +684,6 @@ static __init int hide_self_init(void)
 			armed++;
 	}
 
-	INIT_WORK(&hide_self_mint_work, hide_self_mint_fn);
-
 	if (hide_self_seccomp) {
 		kp_seq_decimal = init_kprobe("seq_put_decimal_ull",
 					     (kprobe_pre_handler_t)hide_self_kp_seq_decimal_pre);
@@ -852,10 +743,6 @@ static void hide_self_exit(void)
 
 	hide_self_disarm_ret(&kr_getppid);
 	hide_self_disarm_ret(&kr_compat_getppid);
-
-	/* no probe fires now, but a mint queued just before disarming could still
-	 * be pending; let it run out rather than freeing state underneath it */
-	cancel_work_sync(&hide_self_mint_work);
 
 	/* always give the allocation range back, even on a failed setup */
 	hide_self_restore_pid_max();
