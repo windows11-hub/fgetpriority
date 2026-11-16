@@ -189,7 +189,16 @@ MODULE_PARM_DESC(hide_self_getppid_mask, "1 = disguise an oversized getppid() fo
  * is a secondary signal. Leave it off unless a target specifically keys on
  * Seccomp:0, and accept the timing cost only then.
  */
-static int hide_self_seccomp = 1;
+/*
+ * Off by default. The only reason to turn this on is to rewrite a
+ * Seccomp:0 status field, and on this device the Seccomp field is already
+ * correct (apps report 2 because zygote installed the filter), so the
+ * rewrite has nothing to do. The hook sits on seq_put_decimal_ull, which
+ * prints every number in every seq_file - meminfo, stat, cpuinfo, mounts,
+ * every /proc/<pid>/status field - so leaving it armed is a BRK trap on the
+ * single hottest /proc path and makes every app open slowly. Keep it off.
+ */
+static int hide_self_seccomp = 0;
 module_param(hide_self_seccomp, int, 0644);
 MODULE_PARM_DESC(hide_self_seccomp, "1 = rewrite Seccomp:0 to 2 for apps (default 0, hot path)");
 
