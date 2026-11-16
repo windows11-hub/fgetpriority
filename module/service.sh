@@ -15,16 +15,16 @@ echo 1 > /proc/sys/kernel/kptr_restrict
 addr=$(grep " kallsyms_lookup_name$" /proc/kallsyms | awk {'print "0x"$1'})
 echo "$kptr_set" > /proc/sys/kernel/kptr_restrict
 
-# ---- reload ---------------------------------------------------------------
-# rmmod takes the MODULE NAME, not the .ko file path. Passing "$KO" (the path)
-# makes rmmod fail silently, so the module stays loaded and its .text patches
-# (branch patch on the priority syscalls) survive into the next insmod. The
-# re-init then cannot re-apply a patch that is already in place and falls back
-# to the kprobe path - the BRK-trap path that makes apps open slowly.
-if lsmod | grep -q fgetpriority; then
-	rmmod fgetpriority 2>/dev/null
-fi
-
-if ! insmod "$KO" kallsyms_lookup_name_fn="$addr"; then
+# ---- load (never unload) -------------------------------------------------
+# The module unlinks itself from /proc/modules and deletes /sys/module/<name>,
+# so lsmod cannot detect it. It instead exposes a dedicated flag at
+# /sys/kernel/fgetpriority/loaded (value 1). Read that: if it says 1 the
+# module (and its .text branch patches) is already resident and must NOT be
+# reloaded - a reload would re-apply a patch that is already in place, fail,
+# and fall back to the kprobe (BRK-trap) path that makes apps open slowly.
+# Only insmod when the flag is absent.
+if [ "$(cat /sys/kernel/fgetpriority/loaded 2>/dev/null)" = "1" ]; then
+	: # already loaded - leave it and its patches untouched
+elif ! insmod "$KO" kallsyms_lookup_name_fn="$addr"; then
 	ksud insmod "$KO" kallsyms_lookup_name_fn="$addr"
 fi
