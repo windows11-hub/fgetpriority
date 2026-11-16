@@ -16,8 +16,13 @@ addr=$(grep " kallsyms_lookup_name$" /proc/kallsyms | awk {'print "0x"$1'})
 echo "$kptr_set" > /proc/sys/kernel/kptr_restrict
 
 # ---- reload ---------------------------------------------------------------
+# rmmod takes the MODULE NAME, not the .ko file path. Passing "$KO" (the path)
+# makes rmmod fail silently, so the module stays loaded and its .text patches
+# (branch patch on the priority syscalls) survive into the next insmod. The
+# re-init then cannot re-apply a patch that is already in place and falls back
+# to the kprobe path - the BRK-trap path that makes apps open slowly.
 if lsmod | grep -q fgetpriority; then
-	rmmod "$KO"
+	rmmod fgetpriority 2>/dev/null
 fi
 
 if ! insmod "$KO" kallsyms_lookup_name_fn="$addr"; then
