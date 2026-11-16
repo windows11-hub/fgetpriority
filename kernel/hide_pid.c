@@ -135,7 +135,7 @@
  * 7. KNOWN GAPS (by design, not bugs)
  *
  *  - Table-wide walks that never name a pid are untouched: kill(-1, 0) still
- *    returns 0. getpriority(PRIO_USER, uid), the channel the 鏄ョ detector uses
+ *    returns 0. getpriority(PRIO_USER, uid), the channel the 春秋 detector uses
  *    for its "hidden app list" check, is already handled by routine_raw.c.
  *  - Thread ids are not filtered; the match key is the group leader pid, which
  *    is what task_pid_nr()/ps show.
@@ -808,18 +808,32 @@ static __init int hide_pid_init(void)
 		hide_scan_ms = HIDE_SCAN_MIN_MS;
 	}
 
-	if (!hide_arm("find_pid_ns", (kprobe_pre_handler_t)kp_find_pid_ns_pre,
-		      &kp_find_pid_ns))
-		armed++;
+	/*
+	 * The three pid-lookup kprobes exist ONLY to hide hide_comm_list. They sit
+	 * on find_pid_ns / find_task_by_pid_ns / find_ge_pid, which are among the
+	 * hottest functions in the kernel - every kill, waitid and /proc open
+	 * traps through them. With an empty hide_comm_list there is nothing to
+	 * hide, so registering them only burns a BRK trap on the hottest path and
+	 * makes apps open slowly for no gain. Skip them entirely when no target
+	 * is configured. Module-list hiding (hide_module_unlink) is separate and
+	 * is still done by main.c.
+	 */
+	if (hide_comm_list && hide_comm_list[0]) {
+		if (!hide_arm("find_pid_ns", (kprobe_pre_handler_t)kp_find_pid_ns_pre,
+			      &kp_find_pid_ns))
+			armed++;
 
-	if (!hide_arm("find_task_by_pid_ns",
-		      (kprobe_pre_handler_t)kp_find_task_by_pid_ns_pre,
-		      &kp_find_task_by_pid_ns))
-		armed++;
+		if (!hide_arm("find_task_by_pid_ns",
+			      (kprobe_pre_handler_t)kp_find_task_by_pid_ns_pre,
+			      &kp_find_task_by_pid_ns))
+			armed++;
 
-	if (!hide_arm("find_ge_pid", (kprobe_pre_handler_t)kp_find_ge_pid_pre,
-		      &kp_find_ge_pid))
-		armed++;
+		if (!hide_arm("find_ge_pid", (kprobe_pre_handler_t)kp_find_ge_pid_pre,
+			      &kp_find_ge_pid))
+			armed++;
+	} else {
+		pr_info("hide_pid: hide_comm_list empty, pid-lookup kprobes not armed\n");
+	}
 
 	/*
 	 * The module is NOT unlinked here. hide_pid_init() runs early in
@@ -830,21 +844,26 @@ static __init int hide_pid_init(void)
 	 */
 
 	/*
-	 * Publish before returning: does not matter whether the hooks or the set
-	 * land first, an empty set simply hides nothing for that instant.
+	 * Publish and schedule the rescan only when something is actually hidden.
+	 * With an empty comm list the snapshot walk and the periodic rescan are
+	 * pure overhead (a full task-list traversal + allocation on a timer).
 	 */
-	hide_refresh();
-	cur = rcu_dereference_protected(hide_snap, 1);
-	if (!cur || !cur->count)
-		pr_info("hide_pid: no '%s' process yet, will keep scanning\n",
-			hide_comm_list);
+	if (hide_comm_list && hide_comm_list[0]) {
+		hide_refresh();
+		cur = rcu_dereference_protected(hide_snap, 1);
+		if (!cur || !cur->count)
+			pr_info("hide_pid: no '%s' process yet, will keep scanning\n",
+				hide_comm_list);
 
-	if (hide_scan_ms > 0) {
-		hide_scan_period = hide_scan_ms;
-		INIT_DELAYED_WORK(&hide_scan_work, hide_scan_fn);
-		schedule_delayed_work(&hide_scan_work,
-				      msecs_to_jiffies((unsigned int)hide_scan_period));
-		pr_info("hide_pid: rescan every %dms\n", hide_scan_period);
+		if (hide_scan_ms > 0) {
+			hide_scan_period = hide_scan_ms;
+			INIT_DELAYED_WORK(&hide_scan_work, hide_scan_fn);
+			schedule_delayed_work(&hide_scan_work,
+					      msecs_to_jiffies((unsigned int)hide_scan_period));
+			pr_info("hide_pid: rescan every %dms\n", hide_scan_period);
+		}
+	} else {
+		cur = NULL;
 	}
 
 	pr_info("hide_pid: %d hook(s) armed, %d pid(s) hidden\n",
@@ -853,7 +872,11 @@ static __init int hide_pid_init(void)
 		for (i = 0; i < cur->count; i++)
 			pr_info("hide_pid:   pid %d\n", (int)cur->pids[i]);
 
-	return armed ? 0 : -ENODEV;
+	/* empty comm list is not an error: nothing to hide, and no hooks were
+	 * armed (they are deliberately skipped to keep the hot path clean) */
+	if (hide_comm_list && hide_comm_list[0])
+		return armed ? 0 : -ENODEV;
+	return 0;
 }
 
 static void hide_pid_exit(void)
