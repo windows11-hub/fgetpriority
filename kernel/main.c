@@ -54,18 +54,29 @@ module_param(kallsyms_lookup_name_fn, ulong, 0000);
 MODULE_PARM_DESC(kallsyms_lookup_name_fn, "kallsyms_lookup_name symaddr");
 
 /*
- * 1 = reach the priority/ioprio syscalls by rewriting their b/bl callsites
- * to find_user (inline hook), so NO kprobe is left in .text for an integrity
- * scan (hunter's second pass) to see. 0 = fall back to the kprobe path.
+ * 1 = run the getpriority/ioprio uid filter (the module's original feature).
+ * 0 = skip it entirely.
  *
- * Default is now 1: the kprobe path leaves a BRK #0x004 in find_user's
- * prologue that any BRK-scanning detector finds, and it also traps on a hot
- * path. The callsite branch patch rewrites the bl in the four syscall bodies
- * instead and leaves no kprobe behind.
+ * The filter needs to hook find_user, and EVERY way of doing that leaves a
+ * detectable trace and costs time on a hot path: the kprobe path writes a
+ * BRK #0x004 in find_user's prologue (any BRK-scan catches it), and the
+ * branch-patch path rewrites six live .text sites that ART/bionic hit during
+ * app startup (an integrity hash sees the branch, and a bad patch crashes the
+ * forked app). That is exactly what made apps open slowly and what hunter's
+ * second pass flags. The temporary-root detector we now target (getppid) does
+ * not need this feature, so it defaults OFF.
  */
-static int branch_patch = 1;
+static int getpriority_enable = 0;
+module_param(getpriority_enable, int, 0644);
+MODULE_PARM_DESC(getpriority_enable, "1 = run the getpriority/ioprio uid filter (default 0: off)");
+
+/*
+ * Only consulted when getpriority_enable=1: 1 = branch-patch find_user's
+ * callsites (no kprobe), 0 = use the kprobe path. See getpriority_enable.
+ */
+static int branch_patch = 0;
 module_param(branch_patch, int, 0444);
-MODULE_PARM_DESC(branch_patch, "1 = inline-hook find_user callsites (default 1); 0 = kprobe fallback");
+MODULE_PARM_DESC(branch_patch, "1 = inline-hook find_user callsites (when getpriority_enable=1); 0 = kprobe fallback");
 
 /**
  *  kallsyms_lookup_size_offset from sprint_symbol actually
@@ -359,14 +370,20 @@ static int __init fgetpriority_init(void)
 	 */
 	int prio_ret;
 
-	if (branch_patch) {
+	if (!getpriority_enable) {
+		/* feature disabled: no find_user hook of any kind, so no BRK and no
+		 * patched syscall prologue for an integrity scan or a startup path to
+		 * trip over. prio_ret stays 0 (not an error). */
+		prio_ret = 0;
+		pr_info("init: getpriority filter disabled\n");
+	} else if (branch_patch) {
 		prio_ret = getpriority_hook_init();
 		pr_info("init: branch patch ret: %d\n", prio_ret);
 	} else {
 		prio_ret = -EOPNOTSUPP;
 	}
 
-	if (prio_ret) {
+	if (prio_ret && getpriority_enable) {
 		prio_ret = getpriority_kp_init();
 		pr_info("init: priority kprobe ret: %d\n", prio_ret);
 	}
@@ -442,11 +459,13 @@ static void __exit fgetpriority_exit(void)
 	hide_self_exit();
 	hide_pid_exit();
 
-	int r = getpriority_hook_exit();
-	if (r)
-		pr_info("%s: ret: %d \n", __func__, r);
+	if (getpriority_enable) {
+		int r = getpriority_hook_exit();
+		if (r)
+			pr_info("%s: ret: %d \n", __func__, r);
 
-	getpriority_kp_exit();
+		getpriority_kp_exit();
+	}
 	pr_info("exit: ignore rmmod dmesg splat. #notabug\n");
 	pr_info("exit: Goodbye!\n");
 	return;
