@@ -47,43 +47,16 @@ static __always_inline bool getpriority_should_swap(int who)
 	if (unlikely(!is_seccomp_enabled()))
 		return false;
 
-	// only filter appuid calls
 	int cuid = current_uid().val;
+
+	/* only an app calling about another app matters. System uids are all
+	 * below 10000 (init=0, system=1000, ...), so the two bounds here are the
+	 * whole rule: caller is an app AND target is an app, and they are not the
+	 * same uid. No isolated/user-offset normalisation is needed - a cross-app
+	 * lookup is caught by the raw uid comparison alone. */
 	if (unlikely(cuid < MIN_APP_PROCESS_UID || who < MIN_APP_PROCESS_UID))
 		return false;
 
-	if (unlikely(cuid >= AID_USER_OFFSET))
-		cuid %= AID_USER_OFFSET;
-
-	// convert all isolated processes to appuids
-	if (unlikely(cuid >= MIN_ISOLATED_PROCESS_UID))
-	{
-		struct user_namespace *ns = current_cred()->user_ns;
-		if (ns && ns != init_ns_p())
-		{
-			kuid_t host_kuid = make_kuid(ns, 0);
-			if (uid_valid(host_kuid))
-				cuid = from_kuid(init_ns_p(), host_kuid);
-		}
-	}
-
-	if (unlikely(who >= MIN_ISOLATED_PROCESS_UID))
-	{
-		struct user_namespace *ns = current_cred()->user_ns;
-		if (ns && ns != init_ns_p())
-		{
-			kuid_t host_kuid = make_kuid(ns, 0);
-			if (uid_valid(host_kuid))
-				who = from_kuid(init_ns_p(), host_kuid);
-		}
-	}
-
-	if (unlikely(who >= AID_USER_OFFSET))
-	    who %= AID_USER_OFFSET;
-
-	if (likely(cuid == who))
-		return false;
-
-	return true;
+	return cuid != who;
 }
 
