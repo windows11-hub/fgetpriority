@@ -166,23 +166,6 @@ module_param(hide_self_ppid_limit, int, 0644);
 MODULE_PARM_DESC(hide_self_ppid_limit, "a zygote pid below this is what the detector wants (default 5000)");
 
 /*
- * The synthetic parent pid is chosen strictly below RESERVED_PIDS (300).
- *
- * alloc_pid() hands out pids from [pid_min, pid_max], and pid_min is
- * RESERVED_PIDS once the cyclic cursor has passed 300 - which it has on any
- * booted device - so a real process can NEVER be numbered below 300. Putting
- * the fake pid in [2, 300) therefore makes the translation (find_pid_ns on
- * the fake number) collision-free forever: no fork can ever claim it, so the
- * translation can only ever fire on a genuine lookup of the fake number, and
- * never steals a real process's /proc entry. That is what previously made
- * some apps fail to open.
- *
- * A bitmap sized to this reserved range is 300 bits (5 longs).
- */
-#define HIDE_SELF_FAKE_PID_MAX	300	/* == RESERVED_PIDS, the low reserved range */
-#define HIDE_SELF_FAKE_BITMAP_BITS	512	/* bits covering [0, 512), headroom above 300 */
-
-/*
  * 1 = answer apps with a synthetic parent pid when the real one is too large.
  * This is the primary mechanism; wrap_pid_max below is the alternative for
  * devices where masking is not wanted and a real renumber is preferred.
@@ -415,54 +398,53 @@ static __nocfi long hide_self_gphook_getppid(const struct pt_regs *regs)
  * a stranger's comm, which is far more damning than a large pid. The walk is
  * cheap enough here because this only runs when the disguise is (re)built.
  */
+/*
+ * Pick the synthetic parent pid.
+ *
+ * The value must be a REAL, live pid below the limit, not a hole. A fabricated
+ * number has no /proc entry, so an app that looks up its reported parent gets
+ * ENOENT and can fail to start - which is exactly the "some apps will not
+ * open" symptom. A real low pid resolves on its own with no translation hook,
+ * no kprobe and no VFS patching, which is the whole point: the disguise stays
+ * one branch in getppid() and nothing else.
+ *
+ * Return the lowest live pid above 1 (i.e. kthreadd, pid 2, on every kernel).
+ * It is created at boot, never exits, and is always below the limit, so it is
+ * both always resolvable and stable for the life of the boot.
+ */
 static pid_t hide_self_pick_fake_pid(pid_t avoid)
 {
 	struct task_struct *init = (struct task_struct *)hide_self_init_task;
-	DECLARE_BITMAP(used, HIDE_SELF_FAKE_BITMAP_BITS);
 	struct task_struct *p;
-	pid_t candidate;
-	int attempt;
+	pid_t found = 0;
 
 	if (!init)
 		return 0;
 
-	bitmap_zero(used, HIDE_SELF_FAKE_BITMAP_BITS);
-
-	/* mark every pid below the reserved bound that some task currently owns.
-	 * Only boot-time kernel threads live in [2, 300), and they are fixed, so
-	 * the free ones stay free for the life of the boot. */
+	/*
+	 * Lowest live pid >= 2. On a normal Android kernel this is kthreadd (2).
+	 * Walk once; the result never changes during a boot because the early
+	 * kernel threads are pinned and never exit.
+	 */
 	rcu_read_lock();
 	list_for_each_entry_rcu(p, &init->tasks, tasks) {
-		int nr = task_pid_nr(p);
+		pid_t nr;
 
-		if (nr > 1 && nr < HIDE_SELF_FAKE_PID_MAX)
-			__set_bit(nr, used);
+		if (p->group_leader != p)
+			continue;
+
+		nr = task_pid_nr(p);
+		if (nr < 2 || nr >= hide_self_ppid_limit)
+			continue;
+		if (nr == avoid)
+			continue;
+
+		if (!found || nr < found)
+			found = nr;
 	}
 	rcu_read_unlock();
 
-	/* pid 0/1 are never valid to hand out */
-	__set_bit(0, used);
-	__set_bit(1, used);
-	if (avoid > 1 && avoid < HIDE_SELF_FAKE_PID_MAX)
-		__set_bit(avoid, used);
-
-	/* deterministic spread, but always inside the reserved range */
-	candidate = 2 + (pid_t)((jiffies_to_msecs(jiffies) + (unsigned long)avoid) %
-				(unsigned int)(HIDE_SELF_FAKE_PID_MAX - 2));
-
-	for (attempt = 0; attempt < HIDE_SELF_FAKE_PID_MAX - 2; attempt++) {
-		if (candidate < 2)
-			candidate = 2;
-		if (candidate >= HIDE_SELF_FAKE_PID_MAX)
-			candidate = 2;
-
-		if (!test_bit(candidate, used))
-			return candidate;
-
-		candidate++;
-	}
-
-	return 0;
+	return found;
 }
 
 /* ------------------------------------------------------------------------ */
