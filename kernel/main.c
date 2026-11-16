@@ -256,6 +256,24 @@ resolve:
 
 static struct kobject *mod_kobj_parent_backup = nullptr;
 
+/*
+ * Independent sysfs flag for service.sh: the module unlinks itself from
+ * /proc/modules and deletes /sys/module/<name>, so neither lsmod nor the
+ * module's own sysfs dir can be used to detect "already loaded". This node
+ * lives under /sys/kernel (not under the module dir), so it survives the
+ * module-list unlink and stays readable. service.sh reads its value: 1 means
+ * loaded, anything else / ENOENT means not loaded.
+ */
+static struct kobject *fgetpriority_kobj;
+
+static ssize_t loaded_show(struct kobject *kobj, struct kobj_attribute *attr,
+			   char *buf)
+{
+	return sysfs_emit(buf, "1\n");
+}
+
+static struct kobj_attribute loaded_attr = __ATTR_RO(loaded);
+
 #endif // MODULE
 
 // override kprobe reg and unreg
@@ -413,6 +431,19 @@ static int __init fgetpriority_init(void)
 #ifdef MODULE
 	mod_kobj_parent_backup = THIS_MODULE->mkobj.kobj.parent;
 	kobject_del(&THIS_MODULE->mkobj.kobj);
+
+	/*
+	 * Create the independent loaded-flag AFTER deleting the module's own
+	 * sysfs dir: the flag must stay reachable while the module dir is hidden.
+	 * It lives under /sys/kernel, unrelated to the module kobject.
+	 */
+	fgetpriority_kobj = kobject_create_and_add("fgetpriority", kernel_kobj);
+	if (fgetpriority_kobj) {
+		if (sysfs_create_file(fgetpriority_kobj, &loaded_attr.attr))
+			pr_info("init: failed to create /sys/kernel/fgetpriority/loaded\n");
+	} else {
+		pr_info("init: failed to create /sys/kernel/fgetpriority\n");
+	}
 	/*
 	 * Last act of init, deliberately.
 	 *
@@ -456,6 +487,12 @@ static void __exit fgetpriority_exit(void)
 	 */
 	hide_self_exit();
 	hide_pid_exit();
+
+	if (fgetpriority_kobj) {
+		sysfs_remove_file(fgetpriority_kobj, &loaded_attr.attr);
+		kobject_put(fgetpriority_kobj);
+		fgetpriority_kobj = NULL;
+	}
 
 	if (getpriority_enable) {
 		int r = getpriority_hook_exit();
