@@ -54,29 +54,27 @@ module_param(kallsyms_lookup_name_fn, ulong, 0000);
 MODULE_PARM_DESC(kallsyms_lookup_name_fn, "kallsyms_lookup_name symaddr");
 
 /*
- * 1 = run the getpriority/ioprio uid filter (the module's original feature).
- * 0 = skip it entirely.
- *
- * The filter needs to hook find_user, and EVERY way of doing that leaves a
- * detectable trace and costs time on a hot path: the kprobe path writes a
- * BRK #0x004 in find_user's prologue (any BRK-scan catches it), and the
- * branch-patch path rewrites six live .text sites that ART/bionic hit during
- * app startup (an integrity hash sees the branch, and a bad patch crashes the
- * forked app). That is exactly what made apps open slowly and what hunter's
- * second pass flags. The temporary-root detector we now target (getppid) does
- * not need this feature, so it defaults OFF.
+ * The getpriority/ioprio uid filter is the module's reason to exist: it hides
+ * an app's uid from a cross-app getpriority/setpriority/ioprio lookup by
+ * rewriting find_user. It defaults ON.
  */
-static int getpriority_enable = 0;
+static int getpriority_enable = 1;
 module_param(getpriority_enable, int, 0644);
-MODULE_PARM_DESC(getpriority_enable, "1 = run the getpriority/ioprio uid filter (default 0: off)");
+MODULE_PARM_DESC(getpriority_enable, "1 = run the getpriority/ioprio uid filter (default 1: on)");
 
 /*
- * Only consulted when getpriority_enable=1: 1 = branch-patch find_user's
- * callsites (no kprobe), 0 = use the kprobe path. See getpriority_enable.
+ * How to hook find_user, only consulted when getpriority_enable=1.
+ *
+ * 1 (default) = branch-patch the four syscall callsites to gphook_find_user.
+ *   A plain branch, no BRK trap. The kprobe alternative writes a BRK #0x004
+ *   in find_user's prologue, which is a trap on every getpriority/setpriority/
+ *   ioprio call that ART and bionic make during app startup - the "apps open
+ *   slowly" symptom. The branch patch has no such trap, so it is the default.
+ * 0 = use the kprobe path (fallback for kernels where the patch fails).
  */
-static int branch_patch = 0;
+static int branch_patch = 1;
 module_param(branch_patch, int, 0444);
-MODULE_PARM_DESC(branch_patch, "1 = inline-hook find_user callsites (when getpriority_enable=1); 0 = kprobe fallback");
+MODULE_PARM_DESC(branch_patch, "1 = inline-hook find_user callsites (default 1); 0 = kprobe fallback");
 
 /**
  *  kallsyms_lookup_size_offset from sprint_symbol actually
