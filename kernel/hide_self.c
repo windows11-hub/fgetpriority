@@ -307,38 +307,49 @@ static bool hide_self_pid_max_lowered;
 /* who is asking                                                            */
 /* ------------------------------------------------------------------------ */
 
+/*
+ * Is the caller an ordinary app, decided by its SELinux domain.
+ *
+ * The domain is assigned by the kernel at exec and cannot be changed from
+ * userspace, unlike uid spoofing paths or a comm that can be renamed. Every
+ * ordinary app runs in one of a small set of app domains; system services
+ * (zygote, system_server, ...) run in their own non-app domains. So the
+ * domain string is the trustworthy "is this an app" signal.
+ *
+ * Only reached after getppid() already returned > limit (the soft-reboot
+ * cold path), so the secctx string round-trip here is not on the hot path.
+ */
 static __always_inline bool hide_self_reader_is_app(void)
 {
-	return current_uid().val >= MIN_APP_PROCESS_UID;
-}
+	char *ctx = NULL;
+	u32 sid = 0;
+	int len;
+	bool is_app = false;
 
-/*
- * True when the caller's real parent is a zygote.
- *
- * This is the filter that stops the disguise from clobbering non-zygote
- * parents. Android apps are forked directly by zygote, so getppid() returns
- * the zygote pid - that is the value the detector flags. But an app can fork
- * its own children (Runtime.exec, native fork); for those the real_parent is
- * the app itself, not zygote, and disguising that number corrupts the app's
- * process bookkeeping, which is what made some apps fail to open.
- *
- * Read the comm directly off current->real_parent. No pid lookup, no task
- * walk, no function that this module itself hooks - safe in the inline hook.
- */
-static __always_inline bool hide_self_parent_is_zygote(void)
-{
-	struct task_struct *parent = current->real_parent;
-	const char *comm;
-
-	if (!parent)
+	security_current_getsecid_subj(&sid);
+	if (!sid)
 		return false;
 
-	/* barrier so comm is read against a stable task_struct */
-	smp_rmb();
-	comm = parent->comm;
+	len = security_secid_to_secctx(sid, &ctx, NULL);
+	if (len < 0 || !ctx)
+		return false;
 
-	/* zygote64, zygote, zygote32 all share the stem */
-	return !strncmp(comm, "zygote", 6);
+	/*
+	 * Domain names: untrusted_app, priv_app, platform_app, isolated_app,
+	 * shell_app, etc. Match the "u:r:<name>:" type field. zygote and the
+	 * system services never carry an app domain name.
+	 */
+	if (!strncmp(ctx, "u:r:untrusted_app", 17) ||
+	    !strncmp(ctx, "u:r:priv_app", 12) ||
+	    !strncmp(ctx, "u:r:platform_app", 16) ||
+	    !strncmp(ctx, "u:r:isolated_app", 16) ||
+	    !strncmp(ctx, "u:r:shell_app", 14) ||
+	    !strncmp(ctx, "u:r:ephemeral_app", 17) ||
+	    !strncmp(ctx, "u:r:system_app", 14))
+		is_app = true;
+
+	security_release_secctx(ctx, len);
+	return is_app;
 }
 
 /* forward decl: defined below, after the getppid handler that calls it */
@@ -372,10 +383,20 @@ static __nocfi long hide_self_gphook_getppid(const struct pt_regs *regs)
 		return ret;
 
 	/* only apps are disguised; root/shell/system keep the truth */
-	if (!hide_self_reader_is_app())
+	if (!hide_self_reader_is_app()) {
+		if (hide_self_debug)
+			pr_info("hide_self: getppid %ld non-app uid %u, skip\n",
+				ret, current_uid().val);
 		return ret;
+	}
 
 	want = (pid_t)ret;
+
+	if (hide_self_debug)
+		pr_info("hide_self: app getppid %ld parent_comm=%s fake_for=%d fake_pid=%d\n",
+			ret, current->real_parent ? current->real_parent->comm : "?",
+			(int)smp_load_acquire(&hide_self_fake_for),
+			(int)smp_load_acquire(&hide_self_fake_pid));
 
 	/*
 	 * FAST PATH: if this exact parent was already disguised, answer now. A hit
@@ -388,14 +409,6 @@ static __nocfi long hide_self_gphook_getppid(const struct pt_regs *regs)
 			return (long)fake;
 		return ret;
 	}
-
-	/*
-	 * New parent. Before minting, confirm it is a zygote: an app forked by
-	 * another app reports that app's pid, and disguising it corrupts the parent
-	 * app's bookkeeping (the "some apps will not open" failure). Cold path only.
-	 */
-	if (!hide_self_parent_is_zygote())
-		return ret;
 
 	/* re-mint synchronously so the caller gets the disguise this same syscall */
 	spin_lock(&hide_self_mint_lock);
@@ -494,6 +507,7 @@ static pid_t hide_self_pick_fake_pid(pid_t avoid)
  * no other interface exposes the same number for cross-checking.
  */
 static const char hide_self_seccomp_key[] = "\nSeccomp:\t";
+static const char hide_self_ppid_key[] = "\nPPid:\t";
 
 /*
  * Bounded compare. seq_put_decimal_ull() is called with many delimiters and
