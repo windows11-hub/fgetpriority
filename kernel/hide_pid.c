@@ -328,44 +328,6 @@ static __always_inline bool hide_ns_matches(int nr, struct pid_namespace *ns)
 	return hide_pid_match(nr);
 }
 
-/*
- * Translate a synthesised pid back to the process it stands for.
- *
- * hide_self.c answers getppid() with a made-up number when the real parent
- * would be over the limit. That number is not a live pid, so every lookup an
- * app performs on it has to be redirected at the same place - otherwise
- * /proc/<fake>/comm returns ENOENT and the app can tell the answer it was
- * given does not exist. Redirecting here keeps the whole read path consistent:
- * comm, status, stat and anything else reached through find_pid_ns resolves to
- * the real zygote.
- *
- * Returns 0 when there is nothing to translate.
- */
-static __always_inline int hide_translate_pid(int nr)
-{
-	pid_t fake;
-	pid_t real;
-
-	/*
-	 * Fast path first: when no disguise is active this is a single acquire
-	 * load and a branch, nothing more. This helper runs on find_pid_ns and
-	 * find_task_by_pid_ns - two of the busiest functions in the kernel - so
-	 * keeping the inactive case to one load is what stops the hook from
-	 * showing up as a measurable timing side channel.
-	 */
-	fake = smp_load_acquire(&hide_self_fake_pid);
-	if (unlikely(fake <= 0))
-		return 0;
-	if (nr != fake)
-		return 0;
-
-	real = smp_load_acquire(&hide_self_fake_for);
-	if (real <= 0)
-		return 0;
-
-	return (int)real;
-}
-
 /* ------------------------------------------------------------------------ */
 /* target discovery                                                         */
 /* ------------------------------------------------------------------------ */
@@ -624,20 +586,11 @@ static void hide_scan_fn(struct work_struct *unused)
 static int kp_find_pid_ns_pre(struct kprobe *unused, struct pt_regs *regs)
 {
 	int nr;
-	int real;
 
 	if (!hide_caller_filtered())
 		return 0;
 
 	nr = (int)PT_REGS_PARM1(regs);
-
-	/* a synthesised parent pid resolves to the process it stands for, so
-	 * that every lookup an app makes on the number it was handed works */
-	real = hide_translate_pid(nr);
-	if (real > 0) {
-		PT_REGS_PARM1(regs) = real;
-		return 0;
-	}
 
 	if (hide_ns_matches(nr, (struct pid_namespace *)PT_REGS_PARM2(regs)))
 		PT_REGS_PARM1(regs) = HIDE_ABSENT_PID;
@@ -657,20 +610,11 @@ static int kp_find_pid_ns_pre(struct kprobe *unused, struct pt_regs *regs)
 static int kp_find_task_by_pid_ns_pre(struct kprobe *unused, struct pt_regs *regs)
 {
 	int nr;
-	int real;
 
 	if (!hide_caller_filtered())
 		return 0;
 
 	nr = (int)PT_REGS_PARM1(regs);
-
-	/* this is the gate /proc/<pid> uses: translating the fake pid here is what
-	 * makes open("/proc/<fake>/comm") return the zygote's name */
-	real = hide_translate_pid(nr);
-	if (real > 0) {
-		PT_REGS_PARM1(regs) = real;
-		return 0;
-	}
 
 	if (hide_ns_matches(nr, (struct pid_namespace *)PT_REGS_PARM2(regs)))
 		PT_REGS_PARM1(regs) = HIDE_ABSENT_PID;
