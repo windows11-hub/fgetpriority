@@ -308,48 +308,22 @@ static bool hide_self_pid_max_lowered;
 /* ------------------------------------------------------------------------ */
 
 /*
- * Is the caller an ordinary app, decided by its SELinux domain.
+ * Is the caller an ordinary app?
  *
- * The domain is assigned by the kernel at exec and cannot be changed from
- * userspace, unlike uid spoofing paths or a comm that can be renamed. Every
- * ordinary app runs in one of a small set of app domains; system services
- * (zygote, system_server, ...) run in their own non-app domains. So the
- * domain string is the trustworthy "is this an app" signal.
+ * Decided by the seccomp state, not by uid. zygote installs a seccomp filter
+ * into every real app process, so "has a seccomp filter" is the kernel-side
+ * marker of "this is an app" - and it is exactly the field the detector reads
+ * the other way around (a missing filter -> Seccomp:0 -> "免解"). A uid can
+ * be anything (0, 1000, setuid-ed), but a process cannot remove a seccomp
+ * filter once installed, so the flag is trustworthy and cannot be spoofed
+ * from userspace.
  *
- * Only reached after getppid() already returned > limit (the soft-reboot
- * cold path), so the secctx string round-trip here is not on the hot path.
+ * is_seccomp_enabled() reads current->seccomp.mode (or TIF_SECCOMP), which is
+ * available in the syscall context on every kernel we build for (5.10 -> 6.18).
  */
 static __always_inline bool hide_self_reader_is_app(void)
 {
-	char *ctx = NULL;
-	u32 sid = 0;
-	int len;
-	bool is_app = false;
-
-	security_current_getsecid_subj(&sid);
-	if (!sid)
-		return false;
-
-	len = security_secid_to_secctx(sid, &ctx, NULL);
-	if (len < 0 || !ctx)
-		return false;
-
-	/*
-	 * Domain names: untrusted_app, priv_app, platform_app, isolated_app,
-	 * shell_app, etc. Match the "u:r:<name>:" type field. zygote and the
-	 * system services never carry an app domain name.
-	 */
-	if (!strncmp(ctx, "u:r:untrusted_app", 17) ||
-	    !strncmp(ctx, "u:r:priv_app", 12) ||
-	    !strncmp(ctx, "u:r:platform_app", 16) ||
-	    !strncmp(ctx, "u:r:isolated_app", 16) ||
-	    !strncmp(ctx, "u:r:shell_app", 14) ||
-	    !strncmp(ctx, "u:r:ephemeral_app", 17) ||
-	    !strncmp(ctx, "u:r:system_app", 14))
-		is_app = true;
-
-	security_release_secctx(ctx, len);
-	return is_app;
+	return is_seccomp_enabled();
 }
 
 /* forward decl: defined below, after the getppid handler that calls it */
