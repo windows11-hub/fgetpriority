@@ -54,13 +54,18 @@ module_param(kallsyms_lookup_name_fn, ulong, 0000);
 MODULE_PARM_DESC(kallsyms_lookup_name_fn, "kallsyms_lookup_name symaddr");
 
 /*
- * 0 (default) = reach the priority/ioprio syscalls through kprobes only.
- * 1 = also rewrite their b/bl instructions and find_user's prologue.
- * See the comment in fgetpriority_init() for why the default is 0.
+ * 1 = reach the priority/ioprio syscalls by rewriting their b/bl callsites
+ * to find_user (inline hook), so NO kprobe is left in .text for an integrity
+ * scan (hunter's second pass) to see. 0 = fall back to the kprobe path.
+ *
+ * Default is now 1: the kprobe path leaves a BRK #0x004 in find_user's
+ * prologue that any BRK-scanning detector finds, and it also traps on a hot
+ * path. The callsite branch patch rewrites the bl in the four syscall bodies
+ * instead and leaves no kprobe behind.
  */
-static int branch_patch = 0;
+static int branch_patch = 1;
 module_param(branch_patch, int, 0444);
-MODULE_PARM_DESC(branch_patch, "1 = enable live .text branch patching (default 0: kprobes only)");
+MODULE_PARM_DESC(branch_patch, "1 = inline-hook find_user callsites (default 1); 0 = kprobe fallback");
 
 /**
  *  kallsyms_lookup_size_offset from sprint_symbol actually
