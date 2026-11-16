@@ -730,14 +730,14 @@ static __init int hide_self_init(void)
 	}
 
 	/*
-	 * seq_put_decimal_ull is needed whenever the getppid disguise is on: it
-	 * keeps /proc/self/status PPid consistent with the disguised getppid(),
-	 * which is what a two-channel comparison (hunter's second pass) checks.
-	 * The Seccomp rewrite is an independent extra controlled by
-	 * hide_self_seccomp, but the PPid rewrite must always be armed with the
-	 * getppid disguise.
+	 * seq_put_decimal_ull is the hottest seq_file helper - it prints EVERY
+	 * number in EVERY /proc file (meminfo, stat, cpuinfo, every status field).
+	 * A kprobe on it is a BRK trap on every one of those prints, which is what
+	 * makes apps open slowly. It only exists to keep /proc/self/status PPid
+	 * and Seccomp consistent with the disguise, and both are opt-in extras:
+	 * arm it only when explicitly requested, never by default.
 	 */
-	if (hide_self_getppid_mask || hide_self_seccomp) {
+	if (hide_self_seccomp) {
 		kp_seq_decimal = init_kprobe("seq_put_decimal_ull",
 					     (kprobe_pre_handler_t)hide_self_kp_seq_decimal_pre);
 		if (kp_seq_decimal)
