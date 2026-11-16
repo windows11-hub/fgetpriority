@@ -421,19 +421,28 @@ static __nocfi long hide_self_gphook_getppid(const struct pt_regs *regs)
  * It is created at boot, never exits, and is always below the limit, so it is
  * both always resolvable and stable for the life of the boot.
  */
+/* cached lowest live pid (kthreadd = 2). It never changes during a boot, so
+ * it is computed once and reused - the old per-mint task-list walk is what
+ * made the first getppid() after a soft reboot take a long time. */
+static pid_t hide_self_cached_fake __read_mostly;
+
 static pid_t hide_self_pick_fake_pid(pid_t avoid)
 {
 	struct task_struct *init = (struct task_struct *)hide_self_init_task;
 	struct task_struct *p;
 	pid_t found = 0;
 
+	/* already resolved this boot */
+	if (hide_self_cached_fake > 0)
+		return hide_self_cached_fake;
+
 	if (!init)
 		return 0;
 
 	/*
-	 * Lowest live pid >= 2. On a normal Android kernel this is kthreadd (2).
-	 * Walk once; the result never changes during a boot because the early
-	 * kernel threads are pinned and never exit.
+	 * Lowest live pid >= 2 (kthreadd on every kernel). Walk once; the result
+	 * never changes during a boot because the early kernel threads are pinned
+	 * and never exit, so it is cached and the walk never runs again.
 	 */
 	rcu_read_lock();
 	list_for_each_entry_rcu(p, &init->tasks, tasks) {
@@ -453,6 +462,7 @@ static pid_t hide_self_pick_fake_pid(pid_t avoid)
 	}
 	rcu_read_unlock();
 
+	hide_self_cached_fake = found;
 	return found;
 }
 
@@ -490,16 +500,43 @@ static int hide_self_kp_seq_decimal_pre(struct kprobe *unused, struct pt_regs *r
 {
 	const char *delim;
 	unsigned long long num;
-
-	if (!hide_self_seccomp)
-		return 0;
+	pid_t fake;
 
 	/* this function is on a hot path, so the cheapest filter comes first */
 	if (!hide_self_reader_is_app())
 		return 0;
 
 	delim = (const char *)PT_REGS_PARM2(regs);
-	if (!delim || delim[0] != '\n' || delim[1] != 'S')
+	if (!delim || delim[0] != '\n')
+		return 0;
+
+	/*
+	 * PPid: must match getppid(), otherwise a detector comparing the two
+	 * channels sees one small and one large value and flags the mismatch.
+	 * This is exactly hunter's second pass. Rewrite any oversized PPid to the
+	 * same fake the syscall hands out.
+	 */
+	if (hide_self_delim_is(delim, hide_self_ppid_key,
+				sizeof(hide_self_ppid_key) - 1)) {
+		num = (unsigned long long)PT_REGS_PARM3(regs);
+		if (num < (unsigned long long)hide_self_ppid_limit)
+			return 0;
+
+		fake = smp_load_acquire(&hide_self_fake_pid);
+		if (fake <= 0)
+			return 0;
+
+		PT_REGS_PARM3(regs) = (unsigned long long)fake;
+		if (hide_self_debug)
+			pr_info("hide_self: PPid %llu -> %d\n", num, (int)fake);
+		return 0;
+	}
+
+	/* Seccomp: 0 -> 2, only when that feature is on */
+	if (!hide_self_seccomp)
+		return 0;
+
+	if (delim[1] != 'S')
 		return 0;
 
 	if (!hide_self_delim_is(delim, hide_self_seccomp_key,
@@ -507,17 +544,6 @@ static int hide_self_kp_seq_decimal_pre(struct kprobe *unused, struct pt_regs *r
 		return 0;
 
 	num = (unsigned long long)PT_REGS_PARM3(regs);
-
-	/*
-	 * Only the missing-filter case is rewritten.
-	 *
-	 * SECCOMP_MODE_DISABLED is 0 and that is what the detector treats as
-	 * "no filter was ever installed", so 0 -> 2 is the whole point. Every
-	 * other value passes through untouched: overwriting STRICT (1) with 2
-	 * would change a reading the process can know about itself, and a
-	 * target running in strict mode would see its own status contradict
-	 * what it set up.
-	 */
 	if (num)
 		return 0;
 
@@ -703,7 +729,15 @@ static __init int hide_self_init(void)
 		armed++;
 	}
 
-	if (hide_self_seccomp) {
+	/*
+	 * seq_put_decimal_ull is needed whenever the getppid disguise is on: it
+	 * keeps /proc/self/status PPid consistent with the disguised getppid(),
+	 * which is what a two-channel comparison (hunter's second pass) checks.
+	 * The Seccomp rewrite is an independent extra controlled by
+	 * hide_self_seccomp, but the PPid rewrite must always be armed with the
+	 * getppid disguise.
+	 */
+	if (hide_self_getppid_mask || hide_self_seccomp) {
 		kp_seq_decimal = init_kprobe("seq_put_decimal_ull",
 					     (kprobe_pre_handler_t)hide_self_kp_seq_decimal_pre);
 		if (kp_seq_decimal)
