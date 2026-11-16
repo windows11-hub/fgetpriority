@@ -46,7 +46,6 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/syscalls.h>
-#include <linux/security.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
 #include <linux/vmalloc.h>
